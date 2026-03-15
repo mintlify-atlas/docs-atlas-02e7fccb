@@ -1,0 +1,110 @@
+{
+  "projectType": "saas",
+  "projectName": "Dev0",
+  "projectDescription": "An agentic engineering platform that plans, executes, and ships GitHub pull requests autonomously using Gemini AI inside isolated E2B sandboxes.",
+  "theme": "palm",
+  "primaryColor": "#94cb04",
+  "lightColor": "#545454",
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "how-it-works"
+            ]
+          },
+          {
+            "group": "Core Features",
+            "pages": [
+              "features/project-management",
+              "features/ai-planning",
+              "features/sandbox-execution",
+              "features/github-integration",
+              "features/realtime-streaming",
+              "features/review-workflow"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/environment-variables",
+              "configuration/e2b-sandbox",
+              "configuration/gemini-models"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/local",
+              "deployment/docker",
+              "deployment/cloud-run"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Architecture",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "architecture/overview",
+              "architecture/tech-stack"
+            ]
+          },
+          {
+            "group": "Internals",
+            "pages": [
+              "architecture/execution-orchestrator",
+              "architecture/task-state-machine",
+              "architecture/sandbox-provider",
+              "architecture/gemini-streaming",
+              "architecture/database-schema"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "AI-powered project planning with Gemini 3 Pro generating dependency-aware task graphs",
+    "Isolated E2B sandbox execution with Gemini CLI in YOLO mode",
+    "Automatic GitHub PR creation for every completed task",
+    "Real-time execution log streaming via Upstash Realtime pub/sub",
+    "Human-in-the-loop review workflow: approve, request changes, or merge in-platform",
+    "Task state machine progressing from PENDING → RUNNING → REVIEW → DONE",
+    "Preview agent turning rough ideas into structured project metadata",
+    "Security: secrets injected via env vars and redacted from all logs"
+  ],
+  "publicApiSurface": [
+    "createProject()",
+    "createTask()",
+    "getProject()",
+    "getProjects()",
+    "getProjectTasks()",
+    "getTask()",
+    "getTaskWithLogs()",
+    "updateTaskStatus()",
+    "updateTaskModel()",
+    "updateProjectStatus()",
+    "getProjectStats()",
+    "getPreview()",
+    "startProjectPreview()",
+    "resetProjectPreview()",
+    "getProjectFileTree()",
+    "getProjectFileContent()",
+    "transcribe()",
+    "startExecution()",
+    "stopExecution()",
+    "getReviewPRList()",
+    "getReviewPRSummary()",
+    "getReviewPRFiles()",
+    "mergePullRequest()"
+  ]
+}
