@@ -1,0 +1,262 @@
+---
+title: "Sandbox provider"
+description: "How Dev0 abstracts sandbox environments, provisions E2B sandboxes, injects secrets, and manages the full lifecycle of code execution environments."
+---
+
+Dev0 runs Gemini CLI inside isolated cloud sandboxes. The sandbox layer is built around a **provider abstraction** (`SandboxProvider` interface) so the underlying implementation can be swapped without changes to the orchestrator or the rest of the codebase.
+
+## Provider abstraction
+
+The `SandboxProvider` interface (`src/lib/sandbox/provider-interface.ts`) defines the full contract:
+
+```typescript
+export type SandboxProvider = {
+  createSandbox(config: CreateSandboxConfig): Promise<SandboxInstance>
+  getOrCreateProjectSandbox(
+    projectId: string,
+    taskId?: string,
+  ): Promise<SandboxInstance>
+  executeCommand(
+    sandboxId: string,
+    command: string,
+    options?: ExecuteCommandOptions,
+  ): Promise<CommandResult>
+  executeCommandStreaming(
+    sandboxId: string,
+    command: string,
+    options?: StreamingCommandOptions,
+  ): Promise<CommandResult>
+  executeGemini(
+    sandboxId: string,
+    options: GeminiExecOptions,
+  ): Promise<CommandResult>
+  executeGeminiStreaming(
+    sandboxId: string,
+    options: GeminiExecOptions,
+    callbacks?: StreamingCallbacks,
+  ): Promise<CommandResult>
+  startDevServer(sandboxId: string, command: string): Promise<void>
+  getPreviewUrl(sandboxId: string, port: number): Promise<string>
+  listFiles(sandboxId: string, rootPath: string, options?: { depth?: number }): Promise<SandboxFileEntry[]>
+  readFile(sandboxId: string, path: string): Promise<string>
+  resetProjectSandbox(projectId: string): Promise<SandboxInstance>
+  stopSandbox(sandboxId: string): Promise<void>
+  deleteSandbox(sandboxId: string): Promise<void>
+  getSandbox(sandboxId: string): Promise<SandboxInstance>
+}
+```
+
+The active provider is resolved in `src/lib/sandbox/providers/index.ts` as a singleton:
+
+```typescript
+export function getSandboxProvider(): SandboxProvider {
+  if (!provider) {
+    provider = e2bProvider  // currently the only implementation
+  }
+  return provider
+}
+```
+
+<Info>
+  The provider singleton pattern means adding a new provider (e.g., Daytona, Modal, or a local Docker provider) requires only implementing `SandboxProvider` and updating this factory function.
+</Info>
+
+## Core types
+
+```typescript
+// src/lib/types/sandbox.ts
+
+export type CreateSandboxConfig = {
+  projectId: string
+  techStack: TechStack
+  taskId?: string
+  envVars?: Record<string, string>
+}
+
+export type SandboxInstance = {
+  id: string        // database UUID (sandboxes.id)
+  sandboxId: string // E2B sandbox ID (sandboxes.sandboxId)
+  status: 'ready' | 'running' | 'stopped' | 'error'
+  publicUrl?: string
+}
+
+export type CommandResult = {
+  exitCode: number
+  stdout: string
+  stderr: string
+  duration: number  // milliseconds
+}
+
+export type GeminiExecOptions = {
+  prompt: string
+  model?: string
+  yolo?: boolean
+  cwd?: string
+  onOutput?: (data: string) => void
+}
+
+export type StreamingCallbacks = {
+  onStdout?: (data: string) => void
+  onStderr?: (data: string) => void
+  onComplete?: (exitCode: number) => void
+}
+```
+
+## getOrCreateProjectSandbox()
+
+This is the most important function in the sandbox layer. It implements a **warm sandbox reuse** strategy to avoid cold-start latency on every task:
+
+```typescript
+async getOrCreateProjectSandbox(
+  projectId: string,
+  taskId?: string,
+): Promise<SandboxInstance>
+```
+
+<Steps>
+  <Step title="Check for task-specific sandbox">
+    If `taskId` is provided, queries `sandboxes WHERE task_id = taskId`. If found, attempts to reconnect to the E2B sandbox via `Sandbox.connect()`. If the sandbox is still alive, returns it immediately. If the connection fails, marks the DB record as `STOPPED`.
+  </Step>
+
+  <Step title="Check for project-level READY sandbox">
+    Queries `sandboxes WHERE project_id = projectId AND status = 'READY'`. If found and connectable, reuses it (and updates `task_id` if needed). If not connectable, marks it `STOPPED`.
+  </Step>
+
+  <Step title="Create a new sandbox">
+    If no warm sandbox exists, calls `createSandbox()` to provision a new E2B sandbox, clone the repository, inject secrets, and record the sandbox in the database.
+  </Step>
+</Steps>
+
+## createSandbox() — provisioning flow
+
+<Steps>
+  <Step title="Select the E2B template">
+    Looks up the template name from `env.E2B_TEMPLATE` (default: `dev0-universal`). The template is a pre-built Docker image with Bun, Node.js, Gemini CLI, and the GitHub CLI already installed.
+  </Step>
+
+  <Step title="Inject environment variables">
+    Passes secrets directly into the sandbox via E2B's `envs` option — they are never written to disk as plaintext:
+
+    ```typescript
+    const envVars = {
+      GITHUB_TOKEN: env.GITHUB_TOKEN,
+      GH_TOKEN: env.GITHUB_TOKEN,         // for the gh CLI
+      GEMINI_API_KEY: env.AGENT_GEMINI_API_KEY,
+      AGENT_GEMINI_API_KEY: env.AGENT_GEMINI_API_KEY,
+      ...config.envVars,                  // caller-provided overrides
+    }
+    ```
+  </Step>
+
+  <Step title="Configure Gemini CLI credentials">
+    Writes two files inside the sandbox to configure Gemini CLI for API key auth:
+
+    ```bash
+    # ~/.gemini/settings.json
+    { "selectedAuthType": "gemini-api-key" }
+
+    # ~/.gemini/.env
+    GEMINI_API_KEY="{AGENT_GEMINI_API_KEY}"
+    ```
+
+    Also writes `{PROJECT_DIR}/.gemini/settings.json` so project-scoped Gemini settings are applied.
+  </Step>
+
+  <Step title="Clone the repository">
+    Runs `git clone '{cloneUrl}' ~/project` inside the sandbox. The clone URL has the GitHub token embedded as `https://x-access-token:{GITHUB_TOKEN}@github.com/...`. After cloning, the remote URL is updated with the token so subsequent `git push` operations are authenticated.
+
+    If the clone fails, the sandbox is killed immediately (`sandbox.kill()`) and the error is thrown (with the token redacted from the error message).
+  </Step>
+
+  <Step title="Persist to database">
+    Inserts (or updates) a record in the `sandboxes` table with the E2B sandbox ID, project ID, task ID, `READY` status, and the template name as `snapshotId`. Returns a `SandboxInstance`.
+  </Step>
+</Steps>
+
+## executeGeminiStreaming()
+
+Invokes Gemini CLI in the sandbox with JSONL streaming output:
+
+```typescript
+async executeGeminiStreaming(
+  sandboxId: string,
+  options: GeminiExecOptions,
+  callbacks?: StreamingCallbacks,
+): Promise<CommandResult>
+```
+
+Builds the command:
+
+```bash
+GEMINI_API_KEY='{key}' \
+  unset GOOGLE_CLOUD_PROJECT && \
+  unset GOOGLE_CLOUD_PROJECT_ID && \
+  gemini --yolo \
+         --model gemini-3-pro-preview \
+         --output-format stream-json \
+         -p "{escaped_prompt}"
+```
+
+<Note>
+  `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_PROJECT_ID` are unset to prevent Gemini CLI from attempting Vertex AI auth instead of API key auth. This is important in environments where Cloud credentials may be present.
+</Note>
+
+The command runs via `executeCommandStreaming()` which passes `onStdout`, `onStderr`, and `onComplete` callbacks directly to the E2B `commands.run()` streaming API. This enables byte-level streaming of JSONL events back to the orchestrator.
+
+## executeCommand()
+
+For synchronous shell commands (Git operations, file reads):
+
+```typescript
+async executeCommand(
+  sandboxId: string,
+  command: string,
+  options?: ExecuteCommandOptions,
+): Promise<CommandResult>
+```
+
+All commands are wrapped in `bash -lc '...'` by default (unless `wrapBash: false` is passed). This ensures login shell initialization runs, making tools installed in `~/.local/bin` available. The `cwd` option prepends `cd {cwd} && ` to the command.
+
+E2B's `CommandExitError` is caught and converted to a `CommandResult` with the exit code intact — so callers can inspect `result.exitCode !== 0` without try/catch.
+
+## Secret redaction
+
+The E2B provider includes a `redactSecret()` helper used whenever error messages might include the GitHub token:
+
+```typescript
+function redactSecret(value: string, secret?: string): string {
+  if (!secret) return value
+  return value.split(secret).join('***')
+}
+```
+
+This is applied to `cloneResult.stderr` before throwing clone errors, ensuring tokens never appear in logs or error messages propagated to the UI.
+
+## Sandbox lifecycle
+
+| Operation | What happens |
+|-----------|-------------|
+| `createSandbox()` | New E2B sandbox provisioned, repo cloned, secrets injected, DB record created |
+| `getOrCreateProjectSandbox()` | Warm reuse if alive, otherwise `createSandbox()` |
+| `stopSandbox()` | `sandbox.betaPause()` (E2B snapshot), DB status → `STOPPED` |
+| `deleteSandbox()` | `sandbox.kill()` (E2B hard stop), DB record deleted |
+| `resetProjectSandbox()` | All project sandboxes killed, new sandbox created fresh |
+
+## E2B template: dev0-universal
+
+The sandbox template is built from `templates/e2b/e2b.Dockerfile` and published to E2B with:
+
+```bash
+bun run template:build   # e2b template build -d templates/e2b/e2b.Dockerfile -n dev0-universal
+bun run template:publish # e2b template publish dev0-universal
+```
+
+The template pre-installs everything needed for a task execution session so there is no install time at sandbox boot:
+
+- **Bun** — JavaScript runtime and package manager
+- **Node.js** — required by some npm packages
+- **Gemini CLI** — the agent execution engine
+- **GitHub CLI (`gh`)** — for `gh pr create`
+- **Git** — version control
+
+The default sandbox timeout is `3,600,000 ms` (1 hour), configurable via the `E2B_SANDBOX_TIMEOUT_MS` environment variable.

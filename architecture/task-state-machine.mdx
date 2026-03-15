@@ -1,0 +1,188 @@
+---
+title: "Task state machine"
+description: "All task and project states, valid transitions, and the dependency-aware execution model that drives Dev0's task board."
+---
+
+Dev0 uses two separate state machines: one for **projects** and one for **tasks**. Both are enforced as PostgreSQL enums with Drizzle, ensuring invalid states can never be persisted.
+
+## Task states
+
+The `taskStatusEnum` contains six values:
+
+```typescript
+export const taskStatusEnum = pgEnum('task_status', [
+  'PENDING',
+  'RUNNING',
+  'REVIEW',
+  'DONE',
+  'FAILED',
+  'SKIPPED',
+])
+```
+
+### State descriptions
+
+<ResponseField name="PENDING" type="initial state">
+  The task has been created and is waiting to be executed. All tasks start in this state. A task can only be executed if its dependencies are resolved and no earlier task in the same phase is blocking it.
+</ResponseField>
+
+<ResponseField name="RUNNING" type="active state">
+  The task has been claimed by the orchestrator and Gemini CLI is executing inside the sandbox. The claim is atomic: only one server process can transition a task to `RUNNING` at a time (conditional `UPDATE WHERE status = 'PENDING'`).
+</ResponseField>
+
+<ResponseField name="REVIEW" type="terminal (pending human action)">
+  Gemini CLI exited with code 0, Git changes were committed and pushed, and a GitHub PR was created. The PR URL is stored in `tasks.prUrl`. The task waits for a human to approve, merge, or request changes.
+</ResponseField>
+
+<ResponseField name="DONE" type="terminal">
+  The PR was merged and the task is complete. Successor tasks may now be unblocked. `DONE` is set by the review/merge webhook or manual action in the mission control UI.
+</ResponseField>
+
+<ResponseField name="FAILED" type="retriable terminal">
+  The execution failed — either the Gemini CLI process exited non-zero, a Git operation failed, or the sandbox could not be provisioned. The `attempts` counter is incremented. If `attempts < maxAttempts`, the task can be re-submitted (reset to `PENDING` and re-executed).
+</ResponseField>
+
+<ResponseField name="SKIPPED" type="terminal">
+  The task was manually skipped. Like `DONE`, a skipped task counts as resolved for dependency purposes — successor tasks can proceed.
+</ResponseField>
+
+### Transition diagram
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │              startTask()                │
+                    ▼                                         │
+ PENDING ──────► RUNNING ──────► REVIEW ──────► DONE         │
+   ▲               │                                         │
+   │               │ (exit code ≠ 0,                         │
+   │               │  git failure,             ◄─────────────┘
+   │               ▼  sandbox error)           (reset + retry)
+   │             FAILED
+   │               │
+   └───────────────┘  (attempts < maxAttempts: reset to PENDING)
+
+ PENDING ──────► SKIPPED   (manual skip action)
+ REVIEW  ──────► SKIPPED   (manual skip from review)
+ FAILED  ──────► SKIPPED   (abandon failed task)
+```
+
+### What triggers each transition
+
+| From | To | Trigger |
+|------|----|---------|
+| `PENDING` | `RUNNING` | `claimPendingTask()` in orchestrator — atomic DB update |
+| `RUNNING` | `REVIEW` | `completeTask({ success: true })` — Gemini exit 0 + PR created |
+| `RUNNING` | `FAILED` | `completeTask({ success: false })` — non-zero exit or Git failure |
+| `PENDING` | `SKIPPED` | Manual skip action in mission control UI |
+| `REVIEW` | `DONE` | PR merged (manual update or webhook) |
+| `REVIEW` | `SKIPPED` | Manual skip from review screen |
+| `FAILED` | `PENDING` | Retry action in mission control UI (resets status + sandbox) |
+| `FAILED` | `SKIPPED` | Manual abandon action |
+
+## Project states
+
+The `projectStatusEnum` contains six values:
+
+```typescript
+export const projectStatusEnum = pgEnum('project_status', [
+  'PLANNING',
+  'READY',
+  'ACTIVE',
+  'PAUSED',
+  'COMPLETED',
+  'ARCHIVED',
+])
+```
+
+### State descriptions
+
+<ResponseField name="PLANNING" type="initial state">
+  The project was created and the Planner Agent is generating the task graph. The project has no tasks yet (or tasks are being inserted). The UI shows a spinner/loading state.
+</ResponseField>
+
+<ResponseField name="READY" type="idle state">
+  Planning is complete. All tasks are in `PENDING` state and the project is ready to execute. No sandbox has been provisioned yet.
+</ResponseField>
+
+<ResponseField name="ACTIVE" type="executing state">
+  At least one task is `RUNNING`. The execution orchestrator is active and the real-time log stream is open.
+</ResponseField>
+
+<ResponseField name="PAUSED" type="suspended state">
+  Execution was explicitly paused by the user. Running tasks are allowed to finish, but no new tasks will be claimed until the project is resumed.
+</ResponseField>
+
+<ResponseField name="COMPLETED" type="terminal">
+  All tasks are in `DONE` or `SKIPPED` state. The project is finished.
+</ResponseField>
+
+<ResponseField name="ARCHIVED" type="terminal">
+  The project has been archived. Archived projects are hidden from the default dashboard view.
+</ResponseField>
+
+## Task fields: phase, order, dependencies, attempts
+
+```typescript
+// From the Drizzle schema (src/lib/db/schema.ts)
+phase:        integer  // Phase number (1-5). Groups related tasks.
+order:        integer  // Position within the phase (1-based).
+dependencies: text[]   // Array of task UUIDs that must be DONE/SKIPPED first.
+attempts:     integer  // How many times this task has been attempted. Default 0.
+maxAttempts:  integer  // Maximum allowed retries. Default 3.
+```
+
+## Phase-based execution model
+
+Dev0 executes tasks in a **sequential-between-phases, dependency-aware-within-phase** model.
+
+<Tabs>
+  <Tab title="Within a phase">
+    Tasks within the same phase can potentially run concurrently if their `dependencies` are all satisfied. The current orchestrator implementation runs one task at a time per project (single `runningTaskId` in `projectState`), but the dependency resolution in `getNextRunnableTask()` correctly handles parallel-ready tasks.
+
+    ```
+    Phase 2:
+      task-3 (deps: [task-1, task-2])  → PENDING (unblocked)
+      task-4 (deps: [task-1])          → PENDING (unblocked)
+      task-5 (deps: [task-3])          → PENDING (blocked)
+    ```
+
+    In the example above, task-3 and task-4 are both runnable in phase 2. task-5 must wait for task-3.
+  </Tab>
+  <Tab title="Between phases">
+    The orchestrator will not start any task in phase N+1 while any task in phase N is still incomplete (not `DONE` or `SKIPPED`). The `hasPriorIncomplete` flag in `getNextRunnableTask()` enforces this:
+
+    ```typescript
+    // If any non-PENDING, non-complete task exists before this one,
+    // block all subsequent tasks
+    if (!isComplete(task.status)) hasPriorIncomplete = true
+    ```
+
+    This ensures phase 1 (Foundation) fully completes before phase 2 (Core Features) begins, matching the planner's intent.
+  </Tab>
+</Tabs>
+
+## Gemini model assignment
+
+Each task is assigned a Gemini model by the Planner Agent at creation time, stored in `tasks.geminiModel`:
+
+```typescript
+export const geminiModelEnum = pgEnum('gemini_model', [
+  'gemini-3-flash-preview',  // Fast, lower cost — UI, styling, simple CRUD
+  'gemini-3-pro-preview',    // Deep reasoning — architecture, auth, complex state
+])
+```
+
+The orchestrator passes `task.geminiModel` to `executeGeminiStreaming()` via the `--model` flag. This means the planner's model assignment is honored at execution time without any orchestrator-level override.
+
+## TaskWithBlocked type
+
+The frontend uses a derived type that adds a computed `isBlocked` field:
+
+```typescript
+// src/lib/types/task.ts
+export type TaskWithBlocked = Task & {
+  isBlocked: boolean
+}
+```
+
+This is computed server-side when listing tasks: a task is `isBlocked = true` if it is `PENDING` and has any dependency not yet in `DONE` or `SKIPPED`. The UI renders blocked tasks with a lock indicator.

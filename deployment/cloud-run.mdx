@@ -1,0 +1,254 @@
+---
+title: "Google Cloud Run deployment"
+description: "Deploy Dev0 to Google Cloud Run — the primary recommended cloud deployment target."
+---
+
+Google Cloud Run is the recommended way to deploy Dev0 to the cloud. It runs the Docker container in a fully managed, serverless environment with automatic scaling, HTTPS, and pay-per-request billing.
+
+## Prerequisites
+
+- [Google Cloud SDK (`gcloud`)](https://cloud.google.com/sdk/docs/install) installed and on your PATH
+- A Google Cloud project with **billing enabled**
+- All required credentials: E2B API key, Gemini API keys, GitHub token, Upstash Redis REST URL and token, and a PostgreSQL database reachable from Cloud Run (see the [database section](#database-options) below)
+
+## Deployment steps
+
+<Steps>
+  <Step title="Authenticate with Google Cloud">
+    ```bash
+    gcloud auth login
+    ```
+
+    This opens a browser window for OAuth authentication. For non-interactive environments (CI/CD), use a service account key instead:
+
+    ```bash
+    gcloud auth activate-service-account --key-file=sa-key.json
+    ```
+  </Step>
+
+  <Step title="Set your project">
+    ```bash
+    gcloud config set project YOUR_PROJECT_ID
+    ```
+
+    Replace `YOUR_PROJECT_ID` with your actual GCP project ID (visible in the Cloud Console dashboard).
+  </Step>
+
+  <Step title="Enable required APIs">
+    ```bash
+    gcloud services enable run.googleapis.com cloudbuild.googleapis.com
+    ```
+
+    This enables Cloud Run and Cloud Build — both are required. Cloud Build handles the container build and push to Google Container Registry.
+  </Step>
+
+  <Step title="Build and push the container image">
+    From the root of the repository:
+
+    ```bash
+    gcloud builds submit --tag gcr.io/YOUR_PROJECT_ID/dev0 .
+    ```
+
+    Cloud Build uploads your source to GCS, runs the multi-stage Dockerfile, and pushes the final image to `gcr.io/YOUR_PROJECT_ID/dev0`. Build logs are streamed to your terminal in real time.
+
+    <Tip>
+      Subsequent builds are significantly faster because Cloud Build caches Docker layers. Only changed layers are rebuilt.
+    </Tip>
+  </Step>
+
+  <Step title="Deploy to Cloud Run">
+    ```bash
+    gcloud run deploy dev0 \
+      --image gcr.io/YOUR_PROJECT_ID/dev0 \
+      --region us-central1 \
+      --port 3000 \
+      --allow-unauthenticated \
+      --set-env-vars DATABASE_URL="postgresql://user:password@host:5432/dev0" \
+      --set-env-vars E2B_API_KEY="your-e2b-api-key" \
+      --set-env-vars GOOGLE_GENERATIVE_AI_API_KEY="your-gemini-api-key" \
+      --set-env-vars AGENT_GEMINI_API_KEY="your-agent-gemini-api-key" \
+      --set-env-vars GITHUB_TOKEN="your-github-token" \
+      --set-env-vars UPSTASH_REDIS_REST_URL="https://your-instance.upstash.io" \
+      --set-env-vars UPSTASH_REDIS_REST_TOKEN="your-upstash-token"
+    ```
+
+    Cloud Run will output the service URL on success:
+
+    ```
+    Service URL: https://dev0-xxxxxxxxxxxx-uc.a.run.app
+    ```
+  </Step>
+</Steps>
+
+## Region selection
+
+The example above uses `us-central1`. Choose the region closest to your users and your database to minimize latency:
+
+```bash
+# List available Cloud Run regions
+gcloud run regions list
+```
+
+Common choices:
+
+| Region | Location |
+|---|---|
+| `us-central1` | Iowa, USA |
+| `us-east1` | South Carolina, USA |
+| `europe-west1` | Belgium |
+| `asia-northeast1` | Tokyo, Japan |
+
+<Note>
+  If you are using Cloud SQL, deploy Dev0 in the **same region** as your Cloud SQL instance to avoid cross-region egress charges and latency.
+</Note>
+
+## Authentication (`--allow-unauthenticated`)
+
+The deploy command above includes `--allow-unauthenticated`, which makes the service publicly accessible without any Google credentials. This is appropriate for a public-facing Dev0 instance.
+
+<Warning>
+  If Dev0 is for internal or team use only, **omit** `--allow-unauthenticated`. Traffic will then require a valid Google identity token, which you can provide via IAP (Identity-Aware Proxy) or by granting the `roles/run.invoker` IAM role to specific users or service accounts.
+</Warning>
+
+To restrict access after the fact:
+
+```bash
+gcloud run services remove-iam-policy-binding dev0 \
+  --region us-central1 \
+  --member="allUsers" \
+  --role="roles/run.invoker"
+```
+
+## Managing secrets with Secret Manager
+
+Passing secrets directly via `--set-env-vars` stores them in plain text in the Cloud Run revision configuration. For production, use **Secret Manager** instead:
+
+<Steps>
+  <Step title="Create secrets">
+    ```bash
+    echo -n "your-e2b-api-key" | \
+      gcloud secrets create E2B_API_KEY --data-file=-
+
+    echo -n "your-gemini-api-key" | \
+      gcloud secrets create GOOGLE_GENERATIVE_AI_API_KEY --data-file=-
+
+    # Repeat for each secret...
+    ```
+  </Step>
+
+  <Step title="Grant Cloud Run access to secrets">
+    ```bash
+    # Get the Cloud Run service account
+    PROJECT_NUMBER=$(gcloud projects describe YOUR_PROJECT_ID --format='value(projectNumber)')
+    SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+
+    gcloud secrets add-iam-policy-binding E2B_API_KEY \
+      --member="serviceAccount:${SA}" \
+      --role="roles/secretmanager.secretAccessor"
+
+    # Repeat for each secret...
+    ```
+  </Step>
+
+  <Step title="Deploy using secret references">
+    ```bash
+    gcloud run deploy dev0 \
+      --image gcr.io/YOUR_PROJECT_ID/dev0 \
+      --region us-central1 \
+      --port 3000 \
+      --allow-unauthenticated \
+      --set-secrets E2B_API_KEY=E2B_API_KEY:latest \
+      --set-secrets GOOGLE_GENERATIVE_AI_API_KEY=GOOGLE_GENERATIVE_AI_API_KEY:latest \
+      --set-secrets AGENT_GEMINI_API_KEY=AGENT_GEMINI_API_KEY:latest \
+      --set-secrets GITHUB_TOKEN=GITHUB_TOKEN:latest \
+      --set-secrets UPSTASH_REDIS_REST_URL=UPSTASH_REDIS_REST_URL:latest \
+      --set-secrets UPSTASH_REDIS_REST_TOKEN=UPSTASH_REDIS_REST_TOKEN:latest \
+      --set-env-vars DATABASE_URL="postgresql://user:password@host:5432/dev0"
+    ```
+
+    Secret values are mounted as environment variables at runtime and are not visible in the Cloud Run revision configuration.
+  </Step>
+</Steps>
+
+## Database options
+
+Cloud Run containers are stateless and ephemeral — you need an externally managed PostgreSQL database.
+
+<Tabs>
+  <Tab title="Cloud SQL (recommended)">
+    Cloud SQL for PostgreSQL is the most straightforward option when staying in the Google Cloud ecosystem.
+
+    1. Create a Cloud SQL instance in the same region as your Cloud Run service.
+    2. Use the **Cloud SQL Auth Proxy** via the `--add-cloudsql-instances` flag:
+
+    ```bash
+    gcloud run deploy dev0 \
+      --image gcr.io/YOUR_PROJECT_ID/dev0 \
+      --region us-central1 \
+      --port 3000 \
+      --add-cloudsql-instances YOUR_PROJECT_ID:us-central1:YOUR_INSTANCE_NAME \
+      --set-env-vars DATABASE_URL="postgresql://user:password@/dev0?host=/cloudsql/YOUR_PROJECT_ID:us-central1:YOUR_INSTANCE_NAME" \
+      # ... other env vars
+    ```
+
+    The Cloud SQL Auth Proxy handles secure connectivity without exposing a public IP.
+  </Tab>
+
+  <Tab title="Neon / External PostgreSQL">
+    Any PostgreSQL database with a public endpoint works. [Neon](https://neon.tech) is a popular serverless option with a generous free tier.
+
+    Set `DATABASE_URL` to your Neon connection string:
+
+    ```
+    DATABASE_URL="postgresql://user:password@ep-xxx.us-east-2.aws.neon.tech/dev0?sslmode=require"
+    ```
+
+    Neon's serverless driver (`@neondatabase/serverless`) is already included in Dev0's dependencies.
+  </Tab>
+</Tabs>
+
+## Avoiding cold starts
+
+Cloud Run scales to zero by default — the first request after inactivity incurs a cold start (typically 2–5 seconds for Dev0). For a production deployment where low latency matters, set a minimum instance count:
+
+```bash
+gcloud run services update dev0 \
+  --region us-central1 \
+  --min-instances 1
+```
+
+<Tip>
+  A single warm instance (`--min-instances 1`) eliminates cold starts at the cost of continuous billing for that instance. For a lightly used internal tool, the cost is minimal. For a public app with bursty traffic, keep the default (`0`) and accept occasional cold starts.
+</Tip>
+
+## Redeployment
+
+To deploy a new version after pushing code changes:
+
+```bash
+# Rebuild and push
+gcloud builds submit --tag gcr.io/YOUR_PROJECT_ID/dev0 .
+
+# Deploy the new image (Cloud Run performs a zero-downtime rollout)
+gcloud run deploy dev0 \
+  --image gcr.io/YOUR_PROJECT_ID/dev0 \
+  --region us-central1
+```
+
+Cloud Run performs a zero-downtime rollout by default: the new revision receives traffic only after it passes its startup health check.
+
+## Environment variable reference
+
+| Variable | Required | Description |
+|---|---|---|
+| `DATABASE_URL` | Yes | PostgreSQL connection string |
+| `E2B_API_KEY` | Yes | E2B sandbox API key |
+| `GOOGLE_GENERATIVE_AI_API_KEY` | Yes | Gemini API key for the backend AI SDK |
+| `AGENT_GEMINI_API_KEY` | Yes | Gemini API key injected into sandboxes |
+| `GITHUB_TOKEN` | Yes | GitHub token for repo and PR operations |
+| `UPSTASH_REDIS_REST_URL` | Yes | Upstash Redis REST endpoint |
+| `UPSTASH_REDIS_REST_TOKEN` | Yes | Upstash Redis REST token |
+| `E2B_TEMPLATE` | No | E2B template name (default: `dev0-universal`) |
+| `E2B_SANDBOX_TIMEOUT_MS` | No | Sandbox timeout in ms (default: `3600000`) |
+| `GITHUB_BOT_USERNAME` | No | GitHub bot username (default: `dev0-agent`) |
+| `APP_URL` | No | Public URL of the deployed service |

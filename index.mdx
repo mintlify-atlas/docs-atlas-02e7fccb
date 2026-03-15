@@ -1,97 +1,104 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "Dev0 — Agentic Engineering Platform"
+description: "From zero to one. Ship GitHub pull requests with AI agents running in isolated sandboxes."
 ---
 
-## Setting up
+<img
+  src="https://media.brand.dev/288cc7c4-5cef-4376-950b-bdf0083eedae.png"
+  alt="Dev0"
+  width="80"
+  style={{ marginBottom: "16px" }}
+/>
 
-Get your documentation site up and running in minutes.
+# From zero to one
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
+Dev0 is an agentic engineering platform that turns your product ideas into reviewable GitHub pull requests. You describe what you want to build — Dev0 plans the work, executes tasks inside isolated sandboxes using Gemini AI, and ships each task as a PR ready for your review.
 
-## Make it yours
+Engineers stay in control as technical leads. The platform handles execution.
 
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get Dev0 running locally in under 10 minutes.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="How it works" icon="circle-play" href="/how-it-works">
+    Understand the idea-to-PR pipeline end to end.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Architecture" icon="diagram-project" href="/architecture/overview">
+    Explore the system design and key components.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Configuration" icon="sliders" href="/configuration/environment-variables">
+    Set up API keys, database, and sandbox configuration.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+---
 
-Everything you need to create world-class documentation.
+## What Dev0 does
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+<Steps>
+  <Step title="Describe your idea">
+    Type a rough description of the feature or product you want to build. Dev0's **Preview Agent** (Gemini Flash) converts it into a structured project name, summary, and tech stack in seconds.
+  </Step>
+  <Step title="Generate a task plan">
+    Dev0's **Planner Agent** (Gemini Pro) produces a dependency-aware task graph — breaking the project into ordered phases, each task assigned an appropriate model and execution strategy.
+  </Step>
+  <Step title="Execute in isolation">
+    Each task runs inside a dedicated **E2B sandbox** with Gemini CLI operating in YOLO mode. The agent writes code, runs commands, and commits changes — all in a contained, reproducible environment.
+  </Step>
+  <Step title="Stream live feedback">
+    JSONL events from the sandbox are parsed and streamed to the **Mission Control UI** in real time via Upstash Realtime. You see every tool call, file write, and terminal output as it happens.
+  </Step>
+  <Step title="Review and merge">
+    Every completed task opens a **GitHub pull request** on your project repository. Approve, request changes, or merge directly from the Dev0 review interface — no context switching required.
+  </Step>
+</Steps>
 
-## Need inspiration?
+---
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+## Key differentiators
+
+<CardGroup cols={2}>
+  <Card title="Platform-controlled autonomy" icon="shield-check">
+    Agents run inside E2B sandboxes with strict orchestration and guardrails. No runaway processes.
+  </Card>
+  <Card title="PR-first workflow" icon="code-pull-request">
+    Every task ends with a reviewable GitHub pull request — humans stay in control of what merges.
+  </Card>
+  <Card title="Real-time visibility" icon="wave-pulse">
+    Live task logs and status updates stream directly to the UI via Upstash Realtime pub/sub.
+  </Card>
+  <Card title="Gemini-powered execution" icon="sparkles">
+    Gemini 3 Pro handles planning and Gemini 3 Flash handles fast execution — the right model for each job.
+  </Card>
+  <Card title="Human-in-the-loop" icon="user-check">
+    Approve, request changes, or merge PRs from the Mission Control UI without leaving the platform.
+  </Card>
+  <Card title="Security by design" icon="lock">
+    Secrets are injected via environment variables and automatically redacted from all execution logs.
+  </Card>
+</CardGroup>
+
+---
+
+## Tech stack
+
+<CardGroup cols={3}>
+  <Card title="Frontend" icon="browser">
+    React 19, TanStack Start, TanStack Router, Tailwind CSS, shadcn/ui
+  </Card>
+  <Card title="Backend" icon="server">
+    TanStack Start server actions, Drizzle ORM, PostgreSQL
+  </Card>
+  <Card title="AI" icon="microchip-ai">
+    Gemini 3 Pro/Flash, Vercel AI SDK, Gemini CLI
+  </Card>
+  <Card title="Sandbox" icon="box">
+    E2B isolated environments, Docker templates
+  </Card>
+  <Card title="Realtime" icon="bolt">
+    Upstash Realtime, Upstash Redis pub/sub
+  </Card>
+  <Card title="Tooling" icon="wrench">
+    TypeScript, Bun, Vite, Vitest, Prettier
+  </Card>
+</CardGroup>

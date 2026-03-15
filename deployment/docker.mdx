@@ -1,0 +1,220 @@
+---
+title: "Docker deployment"
+description: "Build and run Dev0 as a Docker container on any Docker-compatible host."
+---
+
+Dev0 ships with a production-ready multi-stage `Dockerfile`. This guide covers building the image, running it with the required environment variables, and a Docker Compose setup for running the app alongside a local PostgreSQL database.
+
+## Prerequisites
+
+- Docker Engine 24+ (or Docker Desktop)
+- All required API keys and credentials (see [Local deployment](/deployment/local) for the full list)
+
+## The Dockerfile
+
+The image uses a three-stage build to keep the final image lean:
+
+```dockerfile
+FROM oven/bun:1 AS base
+WORKDIR /app
+
+# --- Install dependencies ---
+FROM base AS deps
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile
+
+# --- Build with Node (Bun has a known memory issue with Vite builds) ---
+FROM node:22-slim AS build
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+ENV NODE_OPTIONS="--max-old-space-size=4096"
+RUN npm run build
+
+# --- Production image ---
+FROM base AS production
+ENV NODE_ENV=production
+ENV HOST=0.0.0.0
+ENV PORT=3000
+COPY --from=build /app/.output /app/.output
+COPY --from=build /app/public /app/public
+EXPOSE 3000
+CMD ["bun", "--bun", ".output/server/index.mjs"]
+```
+
+**Stage breakdown:**
+- **`deps`** — installs all npm dependencies using `bun install --frozen-lockfile` for reproducible builds.
+- **`build`** — runs the Vite build under Node.js 22 to work around a known memory issue with Bun + Vite for large bundles. `NODE_OPTIONS` is set to allow 4 GB of heap.
+- **`production`** — the final image copies only the compiled `.output/` directory and `public/` assets. No source code or `node_modules` are included, keeping the image small.
+
+## What `.dockerignore` excludes
+
+The `.dockerignore` keeps the build context tight by excluding:
+
+```
+node_modules
+.git
+.env
+.env.local
+.env.*.local
+.output
+.nitro
+.tanstack
+.vinxi
+tests
+coverage
+*.log
+.vscode
+.idea
+```
+
+<Warning>
+  `.env.local` and all other local env files are intentionally excluded from the Docker build context. **Never bake secrets into the image.** Pass all credentials at runtime via `-e` flags or an env file.
+</Warning>
+
+## Build the image
+
+```bash
+docker build -t dev0 .
+```
+
+The build pulls `oven/bun:1` and `node:22-slim` as base images. On first run expect it to take a few minutes; subsequent builds are fast due to layer caching.
+
+## Run the container
+
+Pass all required environment variables at runtime:
+
+```bash
+docker run --rm -p 3000:3000 \
+  -e DATABASE_URL="postgresql://user:password@host:5432/dev0" \
+  -e E2B_API_KEY="your-e2b-api-key" \
+  -e GOOGLE_GENERATIVE_AI_API_KEY="your-gemini-api-key" \
+  -e AGENT_GEMINI_API_KEY="your-agent-gemini-api-key" \
+  -e GITHUB_TOKEN="your-github-token" \
+  -e UPSTASH_REDIS_REST_URL="https://your-instance.upstash.io" \
+  -e UPSTASH_REDIS_REST_TOKEN="your-upstash-token" \
+  dev0
+```
+
+The app will be available at `http://localhost:3000`.
+
+<Warning>
+  If your PostgreSQL instance is running locally on the host machine, `localhost` inside the container refers to the container itself — not your host. Use `host.docker.internal` (Docker Desktop on Mac/Windows) or the host's LAN IP instead:
+
+  ```
+  DATABASE_URL="postgresql://user:password@host.docker.internal:5432/dev0"
+  ```
+
+  On Linux with Docker Engine, use `--network=host` or pass the explicit host IP.
+</Warning>
+
+### Using an env file
+
+For convenience, create an env file (keep it out of version control) and pass it with `--env-file`:
+
+```bash
+# .env.docker  (git-ignored)
+DATABASE_URL=postgresql://user:password@host:5432/dev0
+E2B_API_KEY=your-e2b-api-key
+GOOGLE_GENERATIVE_AI_API_KEY=your-gemini-api-key
+AGENT_GEMINI_API_KEY=your-agent-gemini-api-key
+GITHUB_TOKEN=your-github-token
+UPSTASH_REDIS_REST_URL=https://your-instance.upstash.io
+UPSTASH_REDIS_REST_TOKEN=your-upstash-token
+```
+
+```bash
+docker run --rm -p 3000:3000 --env-file .env.docker dev0
+```
+
+## Docker Compose
+
+The following Compose file runs Dev0 together with a local PostgreSQL container — useful for self-hosted setups or CI environments:
+
+```yaml compose.yml
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: dev0
+      POSTGRES_PASSWORD: dev0
+      POSTGRES_DB: dev0
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dev0"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    image: dev0
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://dev0:dev0@db:5432/dev0
+      E2B_API_KEY: ${E2B_API_KEY}
+      GOOGLE_GENERATIVE_AI_API_KEY: ${GOOGLE_GENERATIVE_AI_API_KEY}
+      AGENT_GEMINI_API_KEY: ${AGENT_GEMINI_API_KEY}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      UPSTASH_REDIS_REST_URL: ${UPSTASH_REDIS_REST_URL}
+      UPSTASH_REDIS_REST_TOKEN: ${UPSTASH_REDIS_REST_TOKEN}
+      APP_URL: http://localhost:3000
+      NODE_ENV: production
+
+volumes:
+  postgres_data:
+```
+
+Start the stack:
+
+```bash
+docker compose up --build
+```
+
+<Note>
+  The Compose file above reads secrets from shell environment variables (e.g. `${E2B_API_KEY}`). Set these in your shell or in a `.env` file in the same directory — Docker Compose loads `.env` automatically.
+</Note>
+
+<Info>
+  After first boot with a fresh database, run database migrations from inside the running container:
+
+  ```bash
+  docker compose exec app bun run db:migrate
+  ```
+</Info>
+
+## Health checks
+
+Dev0 does not ship a dedicated `/healthz` endpoint out of the box. For production container orchestration (ECS, Kubernetes, etc.) you can use a simple HTTP check against the root path:
+
+```yaml
+healthcheck:
+  test: ["CMD", "curl", "-f", "http://localhost:3000/"]
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_period: 15s
+```
+
+## Environment variable reference
+
+| Variable | Required | Description |
+|---|---|---|
+| `DATABASE_URL` | Yes | PostgreSQL connection string |
+| `E2B_API_KEY` | Yes | E2B sandbox API key |
+| `GOOGLE_GENERATIVE_AI_API_KEY` | Yes | Gemini API key for the backend AI SDK |
+| `AGENT_GEMINI_API_KEY` | Yes | Gemini API key injected into sandboxes |
+| `GITHUB_TOKEN` | Yes | GitHub token for repo and PR operations |
+| `UPSTASH_REDIS_REST_URL` | Yes | Upstash Redis REST endpoint |
+| `UPSTASH_REDIS_REST_TOKEN` | Yes | Upstash Redis REST token |
+| `E2B_TEMPLATE` | No | E2B template name (default: `dev0-universal`) |
+| `E2B_SANDBOX_TIMEOUT_MS` | No | Sandbox timeout in ms (default: `3600000`) |
+| `GITHUB_BOT_USERNAME` | No | GitHub bot username (default: `dev0-agent`) |
+| `APP_URL` | No | Public URL of the app (default: `http://localhost:3000`) |

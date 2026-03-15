@@ -1,0 +1,177 @@
+---
+title: "Tech stack"
+description: "Every technology in Dev0's stack with the rationale for each choice."
+---
+
+Dev0 is a full-stack TypeScript application. The table below lists each technology, its role, and why it was chosen over common alternatives.
+
+## Frontend
+
+<CardGroup cols={2}>
+  <Card title="React 19" icon="react">
+    **Role:** UI rendering engine.
+
+    React 19 is used for its concurrent rendering model and the new `use()` hook, which simplifies async data handling in streaming contexts — important for the live log viewer. The entire frontend is a React application served by TanStack Start.
+  </Card>
+  <Card title="TanStack Start" icon="bolt">
+    **Role:** Full-stack framework (SSR + server actions).
+
+    TanStack Start provides file-based routing with type-safe server actions — no separate API layer needed. Unlike Next.js, it does not impose a specific data-fetching model, which fits Dev0's event-driven, streaming-first architecture. The Nitro server adapter enables flexible deployment targets (Node, Docker, Cloud Run).
+  </Card>
+  <Card title="TanStack Router" icon="route">
+    **Role:** Client-side routing with full type safety.
+
+    TanStack Router is co-located with TanStack Start and provides fully type-safe `<Link>` components and route params — eliminating a class of runtime routing bugs. It also powers the parallel route loaders used by the task board.
+  </Card>
+  <Card title="Tailwind CSS v4" icon="paintbrush">
+    **Role:** Utility-first CSS framework.
+
+    Tailwind v4 introduces a CSS-first configuration model (no `tailwind.config.js`), native CSS cascade layers, and a faster Vite plugin. Dev0 uses it with the `@tailwindcss/vite` plugin for zero-config integration and instant HMR.
+  </Card>
+  <Card title="shadcn/ui" icon="sparkles">
+    **Role:** Accessible, unstyled component primitives.
+
+    shadcn/ui components are copied directly into `src/components/ui` — they are not an external dependency. This gives full control over component internals without vendoring a component library. Radix UI primitives underneath ensure keyboard navigation and ARIA compliance.
+  </Card>
+  <Card title="Motion" icon="wand-magic-sparkles">
+    **Role:** Animation library.
+
+    Motion (formerly Framer Motion) powers task card animations, status transition effects, and the streaming log fade-in. It integrates cleanly with React 19's concurrent mode without layout thrashing.
+  </Card>
+</CardGroup>
+
+## Backend
+
+<CardGroup cols={2}>
+  <Card title="TanStack Start server actions" icon="server">
+    **Role:** Server-side logic layer.
+
+    Server actions are co-located with the routes that call them, making the data contract explicit and type-checked end-to-end. The orchestrator, AI pipeline calls, and GitHub operations all run as server actions — no Express or Hono layer needed.
+  </Card>
+  <Card title="TypeScript" icon="code">
+    **Role:** Primary language for frontend and backend.
+
+    TypeScript is used throughout with strict mode enabled. Drizzle ORM's inferred types, Zod schemas, and the realtime schema are all derived from a single source of truth, ensuring database types, API payloads, and UI components stay in sync.
+  </Card>
+</CardGroup>
+
+## Database
+
+<CardGroup cols={2}>
+  <Card title="PostgreSQL" icon="database">
+    **Role:** Primary data store.
+
+    PostgreSQL stores projects, tasks, sandboxes, and task execution logs. Its `JSONB` column type is used for the `events` array in `task_logs` — enabling efficient storage of arbitrarily structured Gemini CLI event objects without a separate document store.
+  </Card>
+  <Card title="Drizzle ORM" icon="layer-group">
+    **Role:** Type-safe ORM and schema manager.
+
+    Drizzle generates TypeScript types directly from the schema definition, so `InferSelectModel<typeof tasks>` is the canonical `Task` type used everywhere. Drizzle Kit handles migrations (`bunx drizzle-kit migrate`) and schema pushes.
+  </Card>
+  <Card title="Neon serverless" icon="bolt">
+    **Role:** Managed PostgreSQL with serverless HTTP driver.
+
+    The `@neondatabase/serverless` driver enables PostgreSQL queries over HTTP — critical for serverless and edge deployments where persistent TCP connections are not viable. Neon also provides connection pooling and auto-suspend for cost efficiency.
+  </Card>
+</CardGroup>
+
+## AI
+
+<CardGroup cols={2}>
+  <Card title="Vercel AI SDK" icon="brain">
+    **Role:** Structured AI output for preview and planning agents.
+
+    The `ai` package with `@ai-sdk/google` provides `generateText()` with `Output.object()` — a pattern that instructs the model to return validated JSON conforming to a Zod schema. This is used for the Preview Agent (project metadata) and the Planner Agent (task graph).
+  </Card>
+  <Card title="Gemini 3 Flash (gemini-3-flash-preview)" icon="zap">
+    **Role:** Fast inference for structured preview generation and simple execution tasks.
+
+    Used by the Preview Agent and assigned to low-complexity tasks (UI components, styling) by the Planner Agent. Flash trades some reasoning depth for significantly lower latency and cost.
+  </Card>
+  <Card title="Gemini 3 Pro (gemini-3-pro-preview)" icon="gem">
+    **Role:** Deep reasoning for planning and complex execution tasks.
+
+    Used by the Planner Agent to generate the full project specification and task dependency graph. Also assigned to high-complexity tasks (architecture, auth, complex state) by the Planner. Pro's extended reasoning window handles large specs cleanly.
+  </Card>
+  <Card title="Gemini CLI" icon="terminal">
+    **Role:** Headless agent execution inside sandboxes.
+
+    Gemini CLI runs inside E2B sandboxes with `--yolo` (no confirmation prompts) and `--output-format stream-json` (JSONL event stream). It has access to the cloned repository and executes file edits, shell commands, and Git operations autonomously.
+  </Card>
+</CardGroup>
+
+## Sandbox
+
+<CardGroup cols={2}>
+  <Card title="E2B" icon="box">
+    **Role:** Isolated cloud sandbox environments.
+
+    E2B provides on-demand Linux sandboxes with sub-second cold start times. Each task runs in its own sandbox instance (or reuses a warm one per project). The E2B SDK's streaming command execution is the foundation for the JSONL event pipeline.
+  </Card>
+  <Card title="Docker (dev0-universal template)" icon="docker">
+    **Role:** Sandbox base image definition.
+
+    The `dev0-universal` E2B template is defined in `templates/e2b/e2b.Dockerfile`. It pre-installs Bun, Node.js, Gemini CLI, and the GitHub CLI (`gh`), so each sandbox starts with all tools ready without a slow install step. Built with `bun run template:build`.
+  </Card>
+</CardGroup>
+
+## Realtime
+
+<CardGroup cols={2}>
+  <Card title="Upstash Realtime" icon="signal-stream">
+    **Role:** WebSocket-based pub/sub for live task logs.
+
+    Upstash Realtime is backed by Redis and provides typed channels with Zod schema validation. The server emits events on `execution:projectId` channels; browsers subscribe with `useRealtime`. It was chosen over SSE or raw WebSockets for its managed infrastructure, Redis durability, and the typed schema API.
+  </Card>
+  <Card title="Upstash Redis" icon="database">
+    **Role:** Backing store for the Realtime pub/sub broker.
+
+    The `@upstash/redis` REST client connects to the same Upstash account. Redis stores channel state and message history. The REST-based client works in serverless environments where persistent connections are unavailable.
+  </Card>
+</CardGroup>
+
+## Developer tooling
+
+<CardGroup cols={2}>
+  <Card title="Bun" icon="egg">
+    **Role:** JavaScript runtime and package manager.
+
+    Bun replaces both npm and Node.js for local development and production. It provides faster installs, built-in TypeScript execution, and a test runner (Vitest-compatible). The production server runs with `bun --bun .output/server/index.mjs`.
+  </Card>
+  <Card title="Vite" icon="bolt">
+    **Role:** Build tool and dev server.
+
+    Vite 7 powers HMR during development and the production bundle. The `@tanstack/router-plugin` generates type-safe route trees at build time. `@tailwindcss/vite` integrates Tailwind without a PostCSS step.
+  </Card>
+  <Card title="Vitest" icon="flask">
+    **Role:** Unit and integration test runner.
+
+    Vitest runs sandbox integration tests (`tests/sandbox.test.ts`) and GitHub API tests (`tests/github.test.ts`). Its compatibility with the Vite config means no separate test bundler configuration is needed.
+  </Card>
+  <Card title="Prettier" icon="wand-sparkles">
+    **Role:** Code formatter.
+
+    Prettier enforces consistent code style across the entire monorepo. Run with `bun run format`.
+  </Card>
+</CardGroup>
+
+## Dependency summary
+
+```json
+// Key production dependencies from package.json
+{
+  "@ai-sdk/google": "^3.0.10",     // Vercel AI SDK Google provider
+  "@neondatabase/serverless": "^1.0.2",
+  "@tanstack/react-router": "^1.132.0",
+  "@tanstack/react-start": "^1.132.0",
+  "@upstash/realtime": "^1.0.2",
+  "@upstash/redis": "^1.36.2",
+  "ai": "^6.0.64",                   // Vercel AI SDK core
+  "drizzle-orm": "^0.45.1",
+  "e2b": "^2.12.0",
+  "motion": "^12.33.0",
+  "react": "^19.2.0",
+  "tailwindcss": "^4.0.6",
+  "zod": "^4.3.5"
+}
+```

@@ -1,0 +1,165 @@
+---
+title: "Sandbox execution"
+description: "How Dev0 spins up isolated E2B sandboxes, executes Gemini CLI with streaming output, and manages the full task lifecycle from claim to PR creation."
+---
+
+Each task runs inside a dedicated, ephemeral [E2B](https://e2b.dev) sandbox. The sandbox contains a cloned copy of the project repository, the Gemini CLI, and all required environment variables. Nothing running inside the sandbox can reach your local machine.
+
+## Sandbox entity
+
+Sandboxes are tracked in the `sandboxes` table:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `uuid` | Internal primary key |
+| `projectId` | `uuid` | Foreign key → `projects.id` |
+| `sandboxId` | `text` | E2B sandbox identifier (unique) |
+| `status` | `sandbox_status` | `READY`, `RUNNING`, or `STOPPED` |
+| `taskId` | `uuid` | The task currently assigned to this sandbox (nullable, unique) |
+| `snapshotId` | `text` | E2B template/snapshot used to create the sandbox |
+| `publicUrl` | `text` | Public preview URL exposed by the sandbox (if a dev server is running) |
+
+### Sandbox status states
+
+| Status | Meaning |
+|---|---|
+| `READY` | Sandbox is running and idle — available for a new task |
+| `RUNNING` | Gemini CLI is actively executing inside the sandbox |
+| `STOPPED` | Sandbox has been shut down or timed out |
+
+## Workspace directory
+
+All file operations inside the sandbox happen relative to:
+
+```
+WORKSPACE_DIR = $HOME/project
+```
+
+This is the directory into which the project GitHub repository is cloned when the sandbox is created. The Gemini CLI runs with `cwd` set to this path, so all relative paths in agent tool calls resolve here.
+
+Each task also gets its own run directory for output artefacts:
+
+```
+$HOME/project/.dev0/runs/<task-id>/
+```
+
+The agent writes `agent-result.json` to this directory on completion.
+
+## Sandbox lifecycle
+
+<Steps>
+  <Step title="Get or create sandbox">
+    `getOrCreateProjectSandbox(projectId, taskId)` is called. If a sandbox already exists for this task it is reused (reconnected via `Sandbox.connect`). Otherwise a new E2B sandbox is created from the configured template.
+  </Step>
+  <Step title="Clone and configure">
+    The repository is cloned into `$HOME/project` using an authenticated HTTPS URL (`x-access-token:<GITHUB_TOKEN>`). Gemini CLI credentials are written to `$HOME/.gemini/settings.json` and `$HOME/.gemini/.env`.
+  </Step>
+  <Step title="Sync to default branch">
+    Before execution starts, `syncRepoToDefaultBranch` runs `git fetch`, detects the default branch, then `git checkout` and `git pull --ff-only` to ensure the sandbox is on the latest commit.
+  </Step>
+  <Step title="Execute Gemini CLI">
+    `executeGeminiStreaming` launches `gemini --output-format stream-json --yolo` with the task prompt. Stdout is parsed line-by-line as JSONL events; stderr is forwarded to the realtime channel.
+  </Step>
+  <Step title="Collect and persist events">
+    Every parsed `GeminiStreamEvent` is appended to `collectedEvents` in memory. On completion (or error), all events are written to the `task_logs` table in a single upsert.
+  </Step>
+  <Step title="Finalise changes">
+    The orchestrator reads `agent-result.json`, stages all changes (`git add -A`), commits, pushes a `dev0/task-<id>` branch, and creates a GitHub PR via `gh pr create`.
+  </Step>
+  <Step title="Complete task">
+    On success the task transitions to `REVIEW` with `prUrl` set. On failure the task transitions to `FAILED` and `attempts` is incremented.
+  </Step>
+</Steps>
+
+## Orchestrator
+
+The orchestrator (`src/lib/execution/orchestrator.ts`) coordinates the full execution flow. Key functions:
+
+### `startTask(projectId, taskId?)`
+
+Entry point called by the `startExecution` server action. If no `taskId` is provided, `getNextRunnableTask` finds the first `PENDING` task with all dependencies satisfied.
+
+The orchestrator uses an in-memory `projectState` map to prevent concurrent executions for the same project:
+
+```ts
+type ProjectRunState = {
+  runningTaskId: string | null
+  sandboxId: string | null
+  starting: boolean
+}
+```
+
+If `runningTaskId` or `starting` is truthy, `startTask` returns early with `alreadyRunning: true`.
+
+### `claimTaskForExecution(projectId, taskId?)`
+
+Attempts to atomically update the task row from `PENDING → RUNNING` using a conditional `UPDATE … WHERE status = 'PENDING'`. If the row was already claimed by another process the update returns zero rows and the function either returns the running task ID or retries (up to `MAX_TASK_CLAIM_ATTEMPTS` times).
+
+### `getNextRunnableTask(projectId)`
+
+Loads all project tasks ordered by `(phase ASC, order ASC)` and walks the list to find the first `PENDING` task where:
+- No previous non-complete task exists in phase/order sequence
+- All `dependencies` IDs are in `DONE` or `SKIPPED` state
+
+## Retry logic
+
+<Tabs>
+  <Tab title="Automatic retry">
+    When a task reaches `FAILED` and `attempts < maxAttempts` (default `maxAttempts = 3`), you can trigger a retry by calling `startExecution` again with the same `taskId`. The orchestrator re-claims the task and runs a fresh Gemini CLI invocation in the same (or a new) sandbox.
+  </Tab>
+  <Tab title="Manual retry via UI">
+    The project view shows a **Retry** button for any `FAILED` task that has remaining attempts. Clicking it calls the `startExecution` server action with the explicit `taskId`.
+  </Tab>
+</Tabs>
+
+```ts
+// Retry a specific failed task
+await startExecution({ projectId, taskId: failedTask.id })
+```
+
+<Note>
+  `attempts` is incremented on failure (including sandbox startup failures). Once `attempts >= maxAttempts`, the task is permanently failed and must be manually reset via `updateTaskStatus` before it can be retried.
+</Note>
+
+## Security: secrets and log redaction
+
+Secrets are passed into the sandbox exclusively through **environment variables** at creation time:
+
+```ts
+const envVars = {
+  GITHUB_TOKEN: env.GITHUB_TOKEN,
+  GH_TOKEN: env.GITHUB_TOKEN,       // for the gh CLI
+  GEMINI_API_KEY: env.AGENT_GEMINI_API_KEY,
+  AGENT_GEMINI_API_KEY: env.AGENT_GEMINI_API_KEY,
+  ...config.envVars,                // any project-specific overrides
+}
+```
+
+**Log redaction** is applied before any sandbox output is forwarded to persistent storage or the realtime channel. The `redactSecret` utility replaces all occurrences of the `GITHUB_TOKEN` value with `***`:
+
+```ts
+function redactSecret(value: string, secret?: string): string {
+  if (!secret) return value
+  return value.split(secret).join('***')
+}
+```
+
+This prevents tokens from leaking into `taskLogs.events` or realtime log payloads.
+
+<Warning>
+  Never hardcode secrets in prompts, task descriptions, or project specs. Secrets are only available inside the sandbox through env vars and are never visible to the Gemini model as literal values.
+</Warning>
+
+## E2B provider
+
+The sandbox abstraction layer (`src/lib/sandbox/provider.ts`) delegates to the active provider. In production the E2B provider (`src/lib/sandbox/providers/e2b.ts`) is used. The provider exposes these key operations:
+
+| Function | Description |
+|---|---|
+| `createSandbox(config)` | Spin up a new E2B sandbox and clone the repo |
+| `getOrCreateProjectSandbox(projectId, taskId?)` | Idempotent — reuses existing sandbox if possible |
+| `executeCommand(sandboxId, command, options?)` | Run a shell command, return `CommandResult` |
+| `executeGeminiStreaming(sandboxId, options, callbacks?)` | Run Gemini CLI with JSONL streaming |
+| `stopSandbox(sandboxId)` | Gracefully stop a running sandbox |
+| `deleteSandbox(sandboxId)` | Permanently destroy the sandbox |
+| `resetProjectSandbox(projectId)` | Stop and recreate the sandbox for a project |

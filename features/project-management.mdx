@@ -1,0 +1,208 @@
+---
+title: "Project management"
+description: "How Dev0 organizes work into projects and tasks, with status lifecycles, dependency graphs, and dashboard views."
+---
+
+Dev0 structures work into two core entities: **Projects** and **Tasks**. A project represents a full application to be built; tasks are the discrete units of work executed by AI agents inside isolated sandboxes.
+
+## Project entity
+
+Every project is stored in the `projects` table and carries the following key fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `uuid` | Primary key, generated randomly |
+| `name` | `text` | Human-readable project name |
+| `description` | `text` | Short description (also used as the GitHub repo description) |
+| `status` | `project_status` | Current lifecycle state |
+| `repoUrl` | `text` | Full GitHub repository HTML URL |
+| `repoName` | `text` | Repository slug used by the GitHub bot |
+| `techStack` | `text` | Template stack (default: `react-vite`) |
+| `theme` | `text` | UI theme (default: `slate`) |
+| `vibeInput` | `text` | Raw user prompt that created the project |
+| `specContent` | `text` | AI-generated project spec in Markdown |
+
+### Project status states
+
+<CardGroup cols={3}>
+  <Card title="PLANNING" icon="circle-dashed">
+    Project created; AI planning pipeline running. Repo not yet provisioned.
+  </Card>
+  <Card title="READY" icon="circle-check">
+    AI plan complete and GitHub repository created. Ready to start execution.
+  </Card>
+  <Card title="ACTIVE" icon="circle-play">
+    At least one task is currently running in a sandbox.
+  </Card>
+  <Card title="PAUSED" icon="circle-pause">
+    Execution is paused by the user. No new tasks will be started.
+  </Card>
+  <Card title="COMPLETED" icon="circle-check-big">
+    All tasks have reached a terminal state (`DONE` or `SKIPPED`).
+  </Card>
+  <Card title="ARCHIVED" icon="archive">
+    Project has been archived and is hidden from the default dashboard view.
+  </Card>
+</CardGroup>
+
+## Task entity
+
+Tasks are stored in the `tasks` table. Each task belongs to exactly one project and is executed independently by an AI agent.
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `uuid` | Primary key |
+| `projectId` | `uuid` | Foreign key → `projects.id` (cascade delete) |
+| `title` | `text` | Short task title |
+| `description` | `text` | Acceptance criteria and implementation notes |
+| `phase` | `integer` | Execution phase (1 = Foundation, 2 = Core, …) |
+| `order` | `integer` | Position within the phase (1-based) |
+| `status` | `task_status` | Current lifecycle state |
+| `geminiModel` | `gemini_model` | Model to use: `gemini-3-flash-preview` or `gemini-3-pro-preview` |
+| `dependencies` | `text[]` | Array of task IDs that must complete before this task runs |
+| `prUrl` | `text` | GitHub Pull Request URL (set after execution) |
+| `prNumber` | `integer` | GitHub PR number (set after execution) |
+| `attempts` | `integer` | Number of execution attempts made |
+| `maxAttempts` | `integer` | Maximum allowed attempts (default: `3`) |
+
+### Task status states
+
+<CardGroup cols={3}>
+  <Card title="PENDING" icon="clock">
+    Waiting to be picked up by the orchestrator. May be blocked by unmet dependencies.
+  </Card>
+  <Card title="RUNNING" icon="loader">
+    Claimed by the orchestrator; Gemini CLI is executing inside a sandbox.
+  </Card>
+  <Card title="REVIEW" icon="eye">
+    Execution succeeded; a Pull Request is open and waiting for human review.
+  </Card>
+  <Card title="DONE" icon="check">
+    PR has been merged. Task is complete.
+  </Card>
+  <Card title="FAILED" icon="x">
+    Execution failed. If `attempts < maxAttempts`, the task can be retried.
+  </Card>
+  <Card title="SKIPPED" icon="forward">
+    Task was intentionally skipped. Treated as complete for dependency resolution.
+  </Card>
+</CardGroup>
+
+### Phases and ordering
+
+Tasks are organised into numbered phases that reflect the build progression:
+
+| Phase | Name | Purpose |
+|---|---|---|
+| 1 | Foundation | Project setup, core utilities |
+| 2 | Core Features | Main functionality, key user flows |
+| 3 | Secondary Features | Additional features and integrations |
+| 4 | Polish | Styling, animations, error handling |
+| 5 | Launch | Testing, documentation, final polish |
+
+Within a phase, tasks are ordered by the `order` field. The orchestrator processes tasks in strict `(phase, order)` sequence — a task will not start until all earlier tasks in the sequence have reached a terminal state (`DONE` or `SKIPPED`) **and** all explicit `dependencies` are satisfied.
+
+### Dependency resolution
+
+A task is considered **blocked** when:
+- Its `status` is `PENDING`, **and**
+- At least one ID listed in `dependencies` has a status other than `DONE` or `SKIPPED`, **or**
+- Any earlier task in phase/order sequence is not yet in a terminal state.
+
+The `isBlocked` flag is computed server-side on every `getProject` / `getProjectTasks` call and is never persisted to the database.
+
+### Retry logic
+
+When a task fails, `attempts` is incremented and the status returns to `FAILED`. The task is eligible for retry as long as `attempts < maxAttempts` (default `maxAttempts = 3`). Retries can be triggered manually from the project view or automatically by the execution pipeline.
+
+## Dashboard
+
+### Listing projects
+
+The `getProjects` server function returns all projects ordered by `createdAt DESC`, each augmented with a `_count.tasks` integer:
+
+```ts
+const projects = await getProjects()
+// Returns: ProjectWithCount[]
+// ProjectWithCount = Project & { _count: { tasks: number } }
+```
+
+### Project statistics
+
+`getProjectStats` returns a breakdown of task counts by status for a given project:
+
+```ts
+const stats = await getProjectStats({ projectId })
+// Returns: ProjectStats
+```
+
+```ts
+type ProjectStats = {
+  total: number
+  pending: number
+  running: number
+  review: number
+  done: number
+  failed: number
+  skipped: number
+}
+```
+
+## Creating a project
+
+<Steps>
+  <Step title="User enters a vibe">
+    The user types a free-form description of the project they want to build (the `vibeInput` field).
+  </Step>
+  <Step title="Preview agent runs">
+    The Preview Agent (Gemini Flash) generates a project name, tagline, and suggested tech stack from the raw input.
+  </Step>
+  <Step title="Project record created">
+    A project row is inserted with `status: 'PLANNING'`. At this point the GitHub repository does not yet exist.
+  </Step>
+  <Step title="Planner agent runs">
+    The Planner Agent (Gemini Pro) generates the full task graph and project spec (`specContent`).
+  </Step>
+  <Step title="Tasks inserted">
+    Task rows are written to the database with correct `phase`, `order`, `dependencies`, and `geminiModel` values.
+  </Step>
+  <Step title="GitHub repository created">
+    A new repo is created from the tech stack template under the bot account. Initial files (`README.md`, `TASKLIST.md`, `LEARNINGS.md`, `.dev0/RULES.md`) are committed.
+  </Step>
+  <Step title="Project promoted to READY">
+    The project record is updated: `status → READY`, `repoUrl` and `repoName` are set.
+  </Step>
+</Steps>
+
+### Server action
+
+```ts
+import { createProject } from '@/lib/actions/project'
+
+const result = await createProject({
+  name: 'RetroLog',
+  description: 'A retro-styled activity logger for teams',
+  vibeInput: 'I want a retro-styled logging app for my dev team',
+  techStack: 'react-vite',
+  theme: 'slate',
+})
+// Returns: { projectId: string; redirectUrl: string }
+```
+
+<Note>
+  `createProject` is a `POST` server function built with TanStack Start's `createServerFn`. It runs entirely server-side and is safe to call from any route loader or action handler.
+</Note>
+
+## Key server functions reference
+
+| Function | Method | Description |
+|---|---|---|
+| `createProject` | POST | Full project creation pipeline |
+| `getProjects` | GET | List all projects with task counts |
+| `getProject` | GET | Single project with tasks and blocked status |
+| `getProjectTasks` | GET | Tasks for a project with blocked status |
+| `getProjectStats` | GET | Task count breakdown by status |
+| `updateProjectStatus` | POST | Update a project's `status` field |
+| `createTask` | POST | Add a task to an existing project |
+| `updateTaskStatus` | POST | Change a task's status, optionally setting `prUrl`/`prNumber` |
+| `updateTaskModel` | POST | Switch between `gemini-3-flash-preview` and `gemini-3-pro-preview` |

@@ -1,0 +1,215 @@
+---
+title: "Execution orchestrator"
+description: "Deep dive into how Dev0 claims tasks, manages sandbox lifecycle, streams Gemini CLI output, and finalizes GitHub pull requests."
+---
+
+The execution orchestrator (`src/lib/execution/orchestrator.ts`) is the central server-side coordinator for task execution. It owns the full lifecycle of a running task: claiming it from the database, booting or reusing a sandbox, streaming Gemini CLI output, persisting logs, running Git operations, and updating task status.
+
+## In-memory project state
+
+Because a server process can handle multiple concurrent projects, the orchestrator tracks per-project execution state in a module-level `Map`:
+
+```typescript
+type ProjectRunState = {
+  runningTaskId: string | null
+  sandboxId: string | null
+  starting: boolean
+}
+
+const projectState = new Map<string, ProjectRunState>()
+```
+
+<Note>
+  `projectState` is in-memory and not replicated. If the server restarts while a task is running, the task will be stuck in `RUNNING` status in the database. This is a known limitation — the task can be reset manually or via the mission control UI.
+</Note>
+
+The `starting` flag guards against duplicate executions: if `startTask()` is called twice for the same project before the sandbox is ready, the second call returns the already-running task immediately without starting a second execution.
+
+## startTask()
+
+`startTask()` is the primary entry point. It performs all synchronous guards before handing off to the async `runTaskExecution()`.
+
+```typescript
+export async function startTask(
+  projectId: string,
+  taskId?: string,
+): Promise<StartTaskResult>
+```
+
+<Steps>
+  <Step title="Guard: already running">
+    Checks `projectState` for an existing `runningTaskId` or `starting` flag. If found, returns `{ alreadyRunning: true }` immediately — no duplicate executions.
+  </Step>
+
+  <Step title="Set starting flag">
+    Writes `{ starting: true }` to `projectState` before any async work. This prevents a second caller from racing through the guard.
+  </Step>
+
+  <Step title="Claim the task">
+    Calls `claimTaskForExecution(projectId, taskId?)`. This atomically flips the task's status from `PENDING` to `RUNNING` in PostgreSQL using a conditional `UPDATE ... WHERE status = 'PENDING'`. If the update affects zero rows (task was already claimed by another process), the claim loop retries up to `MAX_TASK_CLAIM_ATTEMPTS` (3) times.
+  </Step>
+
+  <Step title="Get or create sandbox">
+    Calls `getOrCreateProjectSandbox(projectId, taskId)`. Returns a warm sandbox if one exists and is still alive; otherwise provisions a new E2B sandbox and clones the project repository into it.
+  </Step>
+
+  <Step title="Emit task_started">
+    Publishes `execution.task_started` to the Upstash Realtime channel so the UI immediately shows the task as active.
+  </Step>
+
+  <Step title="Fire-and-forget execution">
+    Calls `void runTaskExecution(projectId, task, sandboxId)` — intentionally not awaited. `startTask()` returns with the `taskId` and `sandboxId` while execution continues asynchronously in the background.
+  </Step>
+</Steps>
+
+## Task claiming and MAX_TASK_CLAIM_ATTEMPTS
+
+Task claiming uses optimistic concurrency. The `claimPendingTask()` function runs:
+
+```typescript
+async function claimPendingTask(taskId: string): Promise<boolean> {
+  const updated = await db
+    .update(tasks)
+    .set({ status: 'RUNNING' })
+    .where(and(eq(tasks.id, taskId), eq(tasks.status, 'PENDING')))
+    .returning()
+
+  return Boolean(updated[0])
+}
+```
+
+If the task was claimed by another server instance between `getNextRunnableTask()` and `claimPendingTask()`, the update returns zero rows and the claim fails. The `claimTaskForExecution()` loop retries up to `MAX_TASK_CLAIM_ATTEMPTS = 3` times before falling back to checking whether another instance already has a running task for this project.
+
+```typescript
+for (let attempt = 0; attempt < MAX_TASK_CLAIM_ATTEMPTS; attempt += 1) {
+  const task = await getNextRunnableTask(projectId)
+  if (!task) throw new Error('No runnable task found for this project')
+  const updated = await claimPendingTask(task.id)
+  if (updated) return { task }
+}
+// If all attempts failed, check if another instance claimed it
+const runningTaskId = await getRunningTaskId(projectId)
+if (runningTaskId) return { alreadyRunning: true, runningTaskId }
+```
+
+## runTaskExecution() — the async core
+
+After `startTask()` returns, `runTaskExecution()` does the heavy lifting:
+
+<Steps>
+  <Step title="Sync repo to default branch">
+    Runs `git fetch origin --prune` and `git pull --ff-only origin {defaultBranch}` inside the sandbox to ensure the workspace is up to date before starting work.
+  </Step>
+
+  <Step title="Build the task prompt">
+    `buildTaskPrompt()` assembles a detailed system prompt containing project name, description, repo info, task title, description, phase, order, and the full project spec. The prompt instructs Gemini CLI to write an `agent-result.json` file on completion.
+  </Step>
+
+  <Step title="Execute Gemini CLI with streaming">
+    Calls `executeGeminiStreaming()` with `--yolo --output-format stream-json`. Two callbacks handle the output:
+
+    - `onStdout`: chunks are accumulated and split on `\n`, then each line is parsed as a `GeminiStreamEvent`. Valid events are added to `collectedEvents` and emitted to Upstash Realtime.
+    - `onStderr`: raw stderr chunks are emitted to Realtime as unstructured log lines.
+  </Step>
+
+  <Step title="Parse JSONL events">
+    The stdout handler uses a `stdoutRemainder` buffer to handle partial lines across chunk boundaries:
+
+    ```typescript
+    const combined = stdoutRemainder + stdoutChunks.join('')
+    const lines = combined.split('\n')
+    stdoutRemainder = lines.pop() ?? ''
+    for (const line of lines) {
+      handleStdoutLine(line) // JSON.parse + isGeminiEvent check
+    }
+    ```
+
+    User message events (`role: 'user'`) are collected but not re-emitted to the UI to avoid echoing the prompt back.
+  </Step>
+
+  <Step title="Persist task logs">
+    After the process exits, `persistTaskLogs()` upserts into the `task_logs` table: all collected events, the last assistant message as `summary`, total token count from the `result` event stats, duration, and `tool_calls_count`.
+  </Step>
+
+  <Step title="Read agent-result.json">
+    Reads `$HOME/project/.dev0/runs/{taskId}/agent-result.json` from the sandbox. This file is written by Gemini CLI at the end of a successful run and contains `commitMessage`, `prTitle`, `prBody`, and `notes`.
+  </Step>
+
+  <Step title="Finalize or fail">
+    If `exitCode === 0`, calls `finalizeTaskChanges()` to run Git operations and create the PR. On success, calls `completeTask()` with `{ success: true, prUrl }`. On non-zero exit or Git failure, calls `completeTask()` with `{ success: false, error }`.
+  </Step>
+</Steps>
+
+## finalizeTaskChanges() — Git and PR creation
+
+`finalizeTaskChanges()` runs entirely inside the E2B sandbox:
+
+```typescript
+// Branch naming convention
+const branchName = `dev0/task-${task.id}`
+
+// Git operations sequence:
+// 1. git remote set-url origin (inject GitHub token)
+// 2. git config user.email / user.name
+// 3. git checkout -B dev0/task-{id}
+// 4. git fetch origin --prune
+// 5. git rebase origin/{defaultBranch}  (abort gracefully on conflict)
+// 6. git add -A
+// 7. git diff --cached --quiet           (detect empty commits)
+// 8. git commit -m "{commitMessage}"
+// 9. git push -u origin dev0/task-{id}
+// 10. gh pr create --title "..." --body "..."
+```
+
+The GitHub token is injected into the remote URL as `https://x-access-token:{GITHUB_TOKEN}@github.com/...` and is never written to disk as a plain credential. After the `gh pr create` command, the PR URL is extracted from stdout/stderr with a regex: `https://github.com/.+/pull/\d+`.
+
+## completeTask() — status transitions
+
+```typescript
+export async function completeTask(
+  projectId: string,
+  taskId: string,
+  result: CompletionResult,
+): Promise<void>
+```
+
+- **Success**: updates task to `REVIEW`, stores `prUrl`, emits `execution.task_review`.
+- **Failure**: updates task to `FAILED`, increments `attempts`, emits `execution.task_failed`.
+
+## getNextRunnableTask() — dependency resolution
+
+The orchestrator resolves task ordering by scanning all tasks for the project ordered by `(phase ASC, order ASC)` and finding the first task that:
+
+1. Has `status === 'PENDING'`
+2. Has no previous task (by phase/order) that is neither `DONE` nor `SKIPPED`
+3. Has all `dependencies[]` resolved (all in `DONE` or `SKIPPED` state)
+
+```typescript
+const isComplete = (status) => status === 'DONE' || status === 'SKIPPED'
+
+// hasPriorIncomplete blocks all subsequent PENDING tasks
+const runnable = allTasks.find((task) => {
+  if (task.status !== 'PENDING') {
+    if (!isComplete(task.status)) hasPriorIncomplete = true
+    return false
+  }
+  if (hasPriorIncomplete) return false
+  const hasUnmetDependencies = !task.dependencies.every(
+    (id) => isComplete(statusById.get(id))
+  )
+  if (hasUnmetDependencies) { hasPriorIncomplete = true; return false }
+  return true
+})
+```
+
+## Error handling and retry
+
+<Warning>
+  The retry mechanism (tracked via `attempts` / `maxAttempts` columns) is enforced at the UI level — the orchestrator itself does not auto-retry. When a task fails, `attempts` is incremented by 1. If `attempts < maxAttempts` (default 3), the task can be re-submitted by the user from the mission control UI, which calls `startTask()` again after resetting the task to `PENDING`.
+</Warning>
+
+Sandbox boot failures call `handleTaskStartFailure()` which marks the task `FAILED` and resets `projectState` so the project is not stuck in the `starting` state.
+
+## stopTask()
+
+While not a public export of the orchestrator itself, the `projectState` map can be inspected with `isProjectRunning(projectId)`. Stopping a task is handled at the application layer by resetting task status and clearing `projectState` — the sandbox itself is paused via `sandbox.betaPause()` in `stopSandbox()`.

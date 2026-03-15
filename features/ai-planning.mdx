@@ -1,0 +1,204 @@
+---
+title: "AI planning"
+description: "How Dev0 uses a two-stage Gemini pipeline to turn a rough idea into a dependency-aware task graph ready for execution."
+---
+
+When you create a project, Dev0 runs a two-stage AI pipeline that transforms your raw idea into a structured execution plan. The two stages are the **Preview Agent** and the **Planner Agent**, each backed by a different Gemini model tuned for its role.
+
+## Stage 1 — Preview Agent
+
+The Preview Agent is the fast first pass. It receives only your raw `vibeInput` and produces an initial project identity.
+
+**Model:** `gemini-3-flash-preview` (`GEMINI_3_FLASH`)
+
+**Input:**
+```ts
+type PreviewAgentInput = {
+  vibeInput: string
+}
+```
+
+**Output schema** (`PreviewOutput`):
+
+| Field | Description |
+|---|---|
+| `name` | A catchy, memorable project name (2–4 words, PascalCase or spaced) |
+| `tagline` | One-sentence summary, ≤ 10 words |
+| `description` | A 2–3 sentence technical description (≤ 300 characters) preserving key requirements, styling cues, and constraints |
+| `techStack` | Recommended stack — always `react-vite` in the current release |
+
+<Info>
+  The Preview Agent runs at temperature `0.7` to produce creative, varied names and taglines. The output is structured using the Vercel AI SDK's `Output.object` with a Zod schema for guaranteed shape.
+</Info>
+
+### Calling the Preview Agent directly
+
+```ts
+import { generatePreview } from '@/lib/ai/preview-agent'
+
+const result = await generatePreview({
+  vibeInput: 'A retro-styled activity logger for my dev team',
+})
+
+if (result.success) {
+  console.log(result.data.name)        // e.g. "RetroLog"
+  console.log(result.data.tagline)     // e.g. "Track every win, beautifully."
+  console.log(result.data.description) // 2–3 sentence tech description
+  console.log(result.data.techStack)   // "react-vite"
+}
+```
+
+## Stage 2 — Planner Agent
+
+The Planner Agent receives the Preview output and produces the complete project blueprint.
+
+**Model:** `gemini-3-pro-preview` (`GEMINI_3_PRO`)
+
+**Input:**
+```ts
+type PlannerAgentInput = {
+  name: string        // from Preview Agent output
+  description: string
+  vibeInput: string   // original user prompt, preserved for context
+  techStack: TechStack
+}
+```
+
+**Output** (`ProjectPlan` from `@/lib/types/planner`):
+
+```ts
+type ProjectPlan = {
+  spec: ProjectSpec
+  tasks: PlannedTask[]
+  readmeContent: string
+}
+```
+
+### ProjectSpec
+
+```ts
+type ProjectSpec = {
+  name: string
+  tagline: string
+  overview: string       // 2–3 paragraph project overview
+  features: string[]     // 3–8 specific, implementable features
+  technicalNotes?: string
+}
+```
+
+The `spec` is serialised to Markdown and stored in the `projects.specContent` column. It is included verbatim in every agent prompt during task execution so the coding agent always has full project context.
+
+### PlannedTask
+
+```ts
+type PlannedTask = {
+  id: string                                          // stable ID, e.g. "task-1"
+  title: string
+  description: string                                 // clear acceptance criteria
+  phase: number                                       // 1–5
+  order: number                                       // 1-based within phase
+  dependencies: string[]                              // IDs of tasks that must complete first
+  complexity: 'low' | 'medium' | 'high'
+  geminiModel: 'gemini-3-flash-preview' | 'gemini-3-pro-preview'
+}
+```
+
+<Note>
+  After generation, all task IDs and their `dependencies` arrays are **normalised** by `normalizePlannedTasks`. This function deduplicates IDs, remaps any changed IDs in dependency references, and filters out any forward-references (a task cannot depend on a task that comes after it in generation order).
+</Note>
+
+## Model selection
+
+The `geminiModel` field on each `PlannedTask` (and persisted on the `tasks` row) controls which model executes that specific task:
+
+| Model | Enum value | Best for |
+|---|---|---|
+| Gemini Flash | `gemini-3-flash-preview` | Straightforward UI components, simple CRUD, styling tasks — low to medium complexity |
+| Gemini Pro | `gemini-3-pro-preview` | Complex state management, auth setup, architectural decisions — medium to high complexity |
+
+The default model for manually created tasks is `gemini-3-flash-preview`. You can change a task's model at any time before execution using `updateTaskModel`.
+
+<Tip>
+  Use `gemini-3-pro-preview` for the first task in each project (foundation/setup) regardless of apparent complexity — the model's stronger reasoning reduces the chance of early architectural mistakes that cascade into later tasks.
+</Tip>
+
+## YOLO-mode execution
+
+All tasks run Gemini CLI with `--yolo` mode enabled (`yolo: true` in `GeminiExecOptions`). In YOLO mode the agent does **not** prompt for confirmation before taking actions — it reads files, writes code, and runs shell commands fully autonomously.
+
+```ts
+const result = await executeGeminiStreaming(
+  sandboxId,
+  {
+    prompt,
+    model: task.geminiModel,
+    yolo: true,          // no interactive confirmation prompts
+    cwd: WORKSPACE_DIR,  // $HOME/project
+  },
+  callbacks,
+)
+```
+
+<Warning>
+  YOLO mode is safe in Dev0 because execution is fully sandboxed inside an isolated E2B environment. The sandbox has no access to your local machine or any external services beyond GitHub.
+</Warning>
+
+## Task graph phases
+
+The Planner Agent follows a five-phase structure when laying out tasks:
+
+<AccordionGroup>
+  <Accordion title="Phase 1 — Foundation">
+    Project-specific setup: client utilities, type definitions, data structures, local storage helpers. The AI skips generic template setup (Tailwind, shadcn/ui, Vite config) because these are already present in the template repository.
+  </Accordion>
+  <Accordion title="Phase 2 — Core Features">
+    The primary user-facing functionality. Main routes, key components, core state management. Tasks in this phase typically have `gemini-3-pro-preview` assignments due to their complexity.
+  </Accordion>
+  <Accordion title="Phase 3 — Secondary Features">
+    Supporting features, additional views, integrations, and non-critical flows.
+  </Accordion>
+  <Accordion title="Phase 4 — Polish">
+    Visual refinements, animations, comprehensive error handling, empty states, and responsive layout fixes.
+  </Accordion>
+  <Accordion title="Phase 5 — Launch">
+    Final documentation updates, type-checking passes, and any remaining cleanup before the project is considered shippable.
+  </Accordion>
+</AccordionGroup>
+
+## Planner events (streaming)
+
+The `PlannerEvent` union type lets you subscribe to incremental planner output:
+
+```ts
+type PlannerEvent =
+  | { type: 'thinking'; content: string }          // internal reasoning
+  | { type: 'spec_generated'; spec: ProjectSpec }  // spec is ready
+  | { type: 'task_added'; task: PlannedTask }      // each task as it is generated
+  | { type: 'complete'; plan: ProjectPlan }        // full plan ready
+  | { type: 'error'; error: string }               // generation failed
+```
+
+## Full pipeline flow
+
+```
+vibeInput
+    │
+    ▼
+┌─────────────────────────────┐
+│  Preview Agent              │  gemini-3-flash-preview
+│  → name, tagline,           │  temperature: 0.7
+│    description, techStack   │
+└─────────────┬───────────────┘
+              │
+              ▼
+┌─────────────────────────────┐
+│  Planner Agent              │  gemini-3-pro-preview
+│  → ProjectSpec              │  temperature: 0.5
+│  → PlannedTask[] (5–20)     │
+│  → readmeContent            │
+└─────────────┬───────────────┘
+              │
+              ▼
+        DB insertion
+    (projects + tasks tables)
+```

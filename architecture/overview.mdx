@@ -1,0 +1,131 @@
+---
+title: "Architecture overview"
+description: "How Dev0's five system layers fit together to take a product idea to a merged GitHub pull request."
+---
+
+Dev0 is built around the **Ralph loop** principle: let a code agent run autonomously until a task is genuinely complete, while keeping every step contained, auditable, and human-reviewable. The platform is composed of five distinct layers that each own a specific concern.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        FRONTEND                             │
+│  TanStack Start · TanStack Router · React 19 · shadcn/ui   │
+│  Mission Control UI  ←→  Live log stream  ←→  Review UI    │
+└───────────────────────────┬─────────────────────────────────┘
+                            │  server actions / queries
+┌───────────────────────────▼─────────────────────────────────┐
+│                        BACKEND                              │
+│       TanStack Start server actions · Drizzle ORM          │
+│       Execution Orchestrator · Task State Machine           │
+└──────────────┬────────────────────────────┬─────────────────┘
+               │ PostgreSQL (Neon)           │ Upstash Redis
+┌──────────────▼────────────┐  ┌────────────▼─────────────────┐
+│        AI PIPELINE        │  │         REALTIME             │
+│  Vercel AI SDK            │  │  Upstash Realtime pub/sub    │
+│  Gemini 3 Flash (preview) │  │  execution:projectId channel │
+│  Gemini 3 Pro  (planning) │  │  task_started / task_log /   │
+│  Gemini CLI (execution)   │  │  task_review / task_failed   │
+└──────────────┬────────────┘  └──────────────────────────────┘
+               │ E2B SDK
+┌──────────────▼────────────────────────────────────────────────┐
+│                   SANDBOX EXECUTION                           │
+│  E2B cloud sandbox  ·  dev0-universal template               │
+│  Gemini CLI (YOLO mode, stream-json output)                  │
+│  Git clone → implement → commit → push → gh pr create       │
+└───────────────────────────────────────────────────────────────┘
+```
+
+## The five layers
+
+<AccordionGroup>
+  <Accordion title="Frontend">
+    Built with **React 19** and **TanStack Start**, the frontend serves the Mission Control UI: a real-time task board, log viewer, diff renderer, and PR review interface. TanStack Router handles file-based routing, and Tailwind CSS v4 with shadcn/ui provides the component system. Motion animates state transitions.
+
+    The frontend subscribes to Upstash Realtime channels so task logs and status updates appear live without polling.
+  </Accordion>
+
+  <Accordion title="Backend — server actions">
+    TanStack Start server actions expose the application API. There are no separate REST endpoints; the frontend calls typed server functions directly. The most important server-side module is the **Execution Orchestrator**, which claims tasks, manages sandbox lifecycle, streams Gemini CLI output, and finalizes Git operations.
+
+    Drizzle ORM with the Neon serverless driver handles all database access.
+  </Accordion>
+
+  <Accordion title="AI pipeline">
+    Three distinct Gemini roles:
+
+    | Role | Model | Invocation |
+    |------|-------|------------|
+    | Preview agent | Gemini 3 Flash | Vercel AI SDK — structured output |
+    | Planner agent | Gemini 3 Pro | Vercel AI SDK — structured output |
+    | Execution agent | Gemini 3 Flash or Pro | Gemini CLI in sandbox |
+
+    The preview and planner agents run server-side using `@ai-sdk/google` and return typed JSON objects validated with Zod schemas. The execution agent runs *inside the sandbox* as a headless `gemini --yolo --output-format stream-json` process.
+  </Accordion>
+
+  <Accordion title="Sandbox execution">
+    Each task runs inside an **E2B** cloud sandbox based on the `dev0-universal` template. The sandbox has the target repository cloned, Gemini CLI installed, and GitHub credentials injected as environment variables. The orchestrator invokes `gemini --yolo --output-format stream-json` and streams JSONL events back to the server in real time.
+
+    When a task completes, the orchestrator runs `git commit`, `git push`, and `gh pr create` inside the sandbox to publish a PR.
+  </Accordion>
+
+  <Accordion title="Realtime">
+    Upstash Realtime provides the pub/sub backbone. The server emits four event types on the `execution:projectId` channel:
+
+    - `execution.task_started` — sandbox is ready, task is running
+    - `execution.task_log` — one line of JSONL output (carries the parsed `GeminiStreamEvent`)
+    - `execution.task_review` — task finished, PR URL available
+    - `execution.task_failed` — task failed with an error message
+
+    The browser subscribes with `useRealtime` and updates the UI without a full page reload.
+  </Accordion>
+</AccordionGroup>
+
+## End-to-end data flow
+
+<Steps>
+  <Step title="Idea → Preview">
+    The user types a rough product idea. The **Preview Agent** (Gemini 3 Flash via Vercel AI SDK) returns a structured `PreviewOutput`: project name, tagline, description, and suggested tech stack. This is shown as a preview card before any database writes occur.
+  </Step>
+
+  <Step title="Plan → Tasks">
+    The user confirms the preview. The **Planner Agent** (Gemini 3 Pro) generates a `ProjectPlan`: a full spec and 5–20 atomic `PlannedTask` objects with phases, dependencies, and per-task Gemini model assignments. Tasks are inserted into the `tasks` table with `PENDING` status.
+  </Step>
+
+  <Step title="Execute">
+    The orchestrator's `startTask()` is called. It claims the next runnable task by atomically updating its status to `RUNNING`, then calls `getOrCreateProjectSandbox()` to get or spin up an E2B sandbox. `executeGeminiStreaming()` starts the Gemini CLI with `--yolo --output-format stream-json`.
+  </Step>
+
+  <Step title="Stream">
+    As Gemini CLI runs, its JSONL stdout is chunked, line-split, and parsed into typed `GeminiStreamEvent` objects. Valid events are emitted to the Upstash Realtime channel so the browser renders them live. All events are collected in memory for persistence.
+  </Step>
+
+  <Step title="Finalize">
+    When the process exits with code 0, `finalizeTaskChanges()` runs git operations inside the sandbox: sync to default branch, checkout task branch `dev0/task-{id}`, stage all changes, commit, push, and run `gh pr create`. The PR URL is extracted from the output.
+  </Step>
+
+  <Step title="Review">
+    The task status is updated to `REVIEW` and a `execution.task_review` event is emitted with the PR URL. The Mission Control UI shows the PR diff, file changes, and review actions. The engineer can approve, merge, or request changes in-platform.
+  </Step>
+</Steps>
+
+## Deep dives
+
+<CardGroup cols={2}>
+  <Card title="Execution orchestrator" icon="gears" href="/architecture/execution-orchestrator">
+    How `startTask()` claims tasks, manages sandboxes, streams Gemini CLI output, and handles failures with retry logic.
+  </Card>
+  <Card title="Task state machine" icon="diagram-project" href="/architecture/task-state-machine">
+    All task and project states, valid transitions, and what triggers each one.
+  </Card>
+  <Card title="Sandbox provider" icon="box" href="/architecture/sandbox-provider">
+    The provider abstraction, E2B integration, secret injection, and sandbox lifecycle management.
+  </Card>
+  <Card title="Gemini event streaming" icon="signal-stream" href="/architecture/gemini-streaming">
+    JSONL event types, the buffering/parsing pipeline, and how events flow from CLI to browser.
+  </Card>
+  <Card title="Database schema" icon="database" href="/architecture/database-schema">
+    All four tables, enums, indexes, and Drizzle relations.
+  </Card>
+  <Card title="Tech stack" icon="layer-group" href="/architecture/tech-stack">
+    Every technology used in Dev0 and the rationale for each choice.
+  </Card>
+</CardGroup>

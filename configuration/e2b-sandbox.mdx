@@ -1,0 +1,215 @@
+---
+title: "E2B sandbox configuration"
+description: "How Dev0 uses E2B cloud sandboxes to run autonomous coding tasks safely in isolation."
+---
+
+Every coding task Dev0 executes runs inside an isolated [E2B](https://e2b.dev) cloud sandbox. Sandboxes provide a fresh, reproducible Linux environment with internet access, a pre-installed toolchain, and automatic cleanup — without any risk to your local machine or production infrastructure.
+
+## What is E2B?
+
+E2B is a cloud sandbox platform that spins up secure, containerised microVMs on demand. Each sandbox is a full Linux environment with a configurable filesystem, network access, and process execution. Dev0 creates one sandbox per project task and uses it to clone the repository, run the Gemini CLI agent, and push the resulting changes as a pull request.
+
+## The dev0-universal template
+
+All sandboxes are created from the `dev0-universal` template — a custom E2B image defined in `templates/e2b/e2b.Dockerfile`. The template is built on top of `node:lts` and includes everything the Gemini CLI agent needs to operate autonomously:
+
+| Tool | Purpose |
+|------|---------|
+| Node.js LTS | JavaScript runtime |
+| Bun | Fast package manager and script runner |
+| GitHub CLI (`gh`) | Repository operations and pull request creation |
+| `@google/gemini-cli` | Autonomous coding agent (YOLO mode) |
+| `ripgrep` | Fast code search inside the project |
+| `git`, `curl`, `jq` | Standard shell utilities |
+
+The Dockerfile also writes a default Gemini settings file at `$HOME/.gemini/settings.json` that configures `gemini-api-key` as the authentication method:
+
+```dockerfile
+FROM node:lts
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV HOME=/root
+WORKDIR /workspace
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    git \
+    gnupg \
+    jq \
+    procps \
+    ripgrep \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install GitHub CLI
+RUN mkdir -p /etc/apt/keyrings \
+  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    | gpg --dearmor -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+  && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+  && echo "deb [arch=$(dpkg --print-architecture) ...] ..." \
+    > /etc/apt/sources.list.d/github-cli.list \
+  && apt-get update && apt-get install -y gh
+
+RUN npm install -g @google/gemini-cli
+RUN npm install -g bun
+
+ENV PATH=/usr/local/bin:$PATH
+
+RUN mkdir -p $HOME/.gemini \
+  && echo '{"selectedAuthType":"gemini-api-key"}' > $HOME/.gemini/settings.json
+```
+
+## Configuration file
+
+The `e2b.toml` file at the repository root identifies the template used by Dev0:
+
+```toml
+# e2b.toml
+team_id      = "a3e7b26a-2761-4441-bad5-83ec8170fa39"
+dockerfile   = "templates/e2b/e2b.Dockerfile"
+template_name = "dev0-universal"
+template_id  = "82cjfam0491ua8d0enim"
+```
+
+You can reference the template by either its name (`dev0-universal`) or its ID (`82cjfam0491ua8d0enim`) when creating sandboxes via the E2B SDK.
+
+## Building and publishing the template
+
+Run these commands from the repository root whenever you change `templates/e2b/e2b.Dockerfile`:
+
+<Steps>
+  <Step title="Install the E2B CLI">
+    ```bash
+    npm install -g e2b
+    ```
+
+    You must be logged in to E2B (`e2b auth login`) before building or publishing.
+  </Step>
+  <Step title="Build the template">
+    ```bash
+    bun run template:build
+    ```
+
+    This runs:
+    ```bash
+    e2b template build -d templates/e2b/e2b.Dockerfile -n dev0-universal
+    ```
+
+    The build uploads the Dockerfile to E2B and produces a new template image.
+  </Step>
+  <Step title="Publish the template">
+    ```bash
+    bun run template:publish
+    ```
+
+    This runs:
+    ```bash
+    e2b template publish dev0-universal
+    ```
+
+    Publishing makes the new image available to your team. New sandboxes created after this point will use the updated template.
+  </Step>
+</Steps>
+
+<Warning>
+  Publish a new template only after thorough local testing. All task execution across your team immediately uses the new image once it is published.
+</Warning>
+
+## Sandbox timeout
+
+The `E2B_SANDBOX_TIMEOUT_MS` environment variable controls how long a sandbox can remain alive before E2B terminates it automatically.
+
+```
+Default: 3600000 ms (1 hour)
+```
+
+The value is read and validated in `src/lib/sandbox/client.ts`:
+
+```typescript
+export function getE2bSandboxTimeoutMs(): number {
+  const parsed = Number(env.E2B_SANDBOX_TIMEOUT_MS)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 3600000
+}
+```
+
+If the value cannot be parsed as a positive finite number, the timeout falls back to 3,600,000 ms. Both the initial sandbox creation call and every subsequent `Sandbox.connect()` call pass this timeout, so the sandbox lifetime is continuously renewed on each connection.
+
+<Tip>
+  For short-lived CI tasks you can reduce the timeout to a few minutes to limit idle compute costs. For interactive development sessions, increase it or implement a keep-alive ping.
+</Tip>
+
+## Sandbox status lifecycle
+
+Each sandbox record in the database carries a `status` field managed by the `sandbox_status` PostgreSQL enum:
+
+| Status | Meaning |
+|--------|---------|
+| `READY` | Sandbox is running and available for task execution. |
+| `RUNNING` | Reserved for future use; task execution is in progress. |
+| `STOPPED` | Sandbox has been paused or killed and is no longer accessible. |
+
+The status transitions are:
+
+1. **Created** — A new sandbox is inserted with status `READY`.
+2. **Connection failure** — If `Sandbox.connect()` throws, the record is updated to `STOPPED`.
+3. **Stopped** — `stopSandbox()` calls `sandbox.betaPause()` and sets the status to `STOPPED`.
+4. **Deleted** — `deleteSandbox()` calls `sandbox.kill()` and removes the record entirely.
+
+## Sandbox creation per project
+
+Dev0 avoids creating a new sandbox for every task. The `getOrCreateProjectSandbox` function first checks for an existing `READY` sandbox for the project before spinning up a new one:
+
+```typescript
+// src/lib/sandbox/provider.ts
+export async function getOrCreateProjectSandbox(
+  projectId: string,
+  taskId?: string,
+): Promise<SandboxInstance> {
+  return provider.getOrCreateProjectSandbox(projectId, taskId)
+}
+```
+
+The lookup priority is:
+
+1. **Task sandbox** — If `taskId` is provided, look for an existing sandbox associated with that task. Reconnect if found and alive.
+2. **Project sandbox** — Look for any `READY` sandbox for the project. Reconnect and reassign the `taskId` if found.
+3. **New sandbox** — Clone the project repository into a fresh `dev0-universal` sandbox and record it in the database.
+
+When a new sandbox is created, Dev0 automatically:
+- Injects `GITHUB_TOKEN`, `GH_TOKEN`, `GEMINI_API_KEY`, and `AGENT_GEMINI_API_KEY` as environment variables.
+- Clones the project repository (or template starter) into `/home/user/project`.
+- Writes the Gemini settings and API key to `$HOME/.gemini/settings.json` and `$HOME/.gemini/.env`.
+
+## Getting an E2B API key
+
+<Steps>
+  <Step title="Create an account">
+    Sign up at [e2b.dev](https://e2b.dev).
+  </Step>
+  <Step title="Generate an API key">
+    In the E2B dashboard, navigate to **API Keys** and create a new key.
+  </Step>
+  <Step title="Add the key to your environment">
+    ```bash
+    # .env.local
+    E2B_API_KEY="your-api-key-here"
+    ```
+  </Step>
+</Steps>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Sandbox creation fails with a clone error">
+    Check that `GITHUB_TOKEN` has **repo** scope and that the bot account (`GITHUB_BOT_USERNAME`) has access to the repository. The error message redacts the token but includes the raw `git clone` stderr output to help diagnose the issue.
+  </Accordion>
+  <Accordion title="Sandbox times out mid-task">
+    Increase `E2B_SANDBOX_TIMEOUT_MS`. The timeout applies from the moment the sandbox is created, not from the start of the current command. Very long tasks may need a value of `7200000` (2 hours) or more.
+  </Accordion>
+  <Accordion title="Template build fails">
+    Make sure you are authenticated (`e2b auth login`) and that your account belongs to the correct team (`team_id` in `e2b.toml`). Check that Docker is running locally if the CLI performs a local build step.
+  </Accordion>
+  <Accordion title="Old template is being used after a publish">
+    Existing sandboxes are not affected by a new template publish. Only sandboxes created after the publish use the updated image. Reset the project sandbox via the application UI or by calling `resetProjectSandbox` to force a fresh sandbox from the new template.
+  </Accordion>
+</AccordionGroup>

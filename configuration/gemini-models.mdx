@@ -1,0 +1,171 @@
+---
+title: "Gemini model configuration"
+description: "How Dev0 selects and configures Gemini models for planning, preview, and autonomous task execution."
+---
+
+Dev0 uses Google's Gemini models at two distinct layers: the **server-side backend** (planning and orchestration) and **inside E2B sandboxes** (autonomous code execution via the Gemini CLI). Each layer uses its own API key and, where applicable, its own model selection.
+
+## Available models
+
+Dev0 supports two Gemini models, defined in `src/lib/ai/models.ts`:
+
+```typescript
+export const GEMINI_3_FLASH = 'gemini-3-flash-preview'
+export const GEMINI_3_PRO   = 'gemini-3-pro-preview'
+```
+
+These values are also the only accepted values for the `gemini_model` column in the `tasks` table.
+
+| Model | Identifier | Best for |
+|-------|-----------|----------|
+| Gemini 3 Flash | `gemini-3-flash-preview` | Fast, straightforward tasks: UI components, simple CRUD, styling |
+| Gemini 3 Pro | `gemini-3-pro-preview` | Complex reasoning: architecture decisions, auth setup, complex state management |
+
+## API keys
+
+Dev0 requires two separate Gemini API keys. Using distinct keys lets you set independent rate limits and quota budgets for server-side orchestration versus sandbox execution.
+
+### GOOGLE_GENERATIVE_AI_API_KEY
+
+Used by the server-side backend via the [Vercel AI SDK](https://sdk.vercel.ai). This key powers:
+
+- **Project planner** (`src/lib/ai/planner-agent.ts`) — generates project specifications and task breakdowns using `gemini-3-pro-preview`.
+- **Preview agent** (`src/lib/ai/preview-agent.ts`) — generates project names, taglines, and descriptions using `gemini-3-flash-preview`.
+
+The Vercel AI SDK reads this key automatically from the `GOOGLE_GENERATIVE_AI_API_KEY` environment variable when you call `google(modelId)`:
+
+```typescript
+import { google } from '@ai-sdk/google'
+import { generateText, Output } from 'ai'
+
+const { output } = await generateText({
+  model: google('gemini-3-pro-preview'),
+  // ...
+})
+```
+
+### AGENT_GEMINI_API_KEY
+
+Injected into every E2B sandbox at creation time. The sandbox agent (Gemini CLI) reads this key to authenticate its API calls during autonomous task execution.
+
+Dev0 passes the key in two ways to ensure it is available regardless of how the Gemini CLI looks it up:
+
+1. **Environment variable** — `GEMINI_API_KEY` and `AGENT_GEMINI_API_KEY` are set as sandbox environment variables.
+2. **Config file** — Written to `$HOME/.gemini/.env` as `GEMINI_API_KEY="..."` and to both `$HOME/.gemini/settings.json` and `{project}/.gemini/settings.json` as `{"selectedAuthType":"gemini-api-key"}`.
+
+<Tip>
+  Using a separate `AGENT_GEMINI_API_KEY` lets you apply a higher quota to sandbox execution (which can be token-intensive) while keeping a lower quota on the server-side orchestration key.
+</Tip>
+
+## Model assignment per task
+
+The Gemini model used for a task is determined at planning time. The planner agent assigns a `geminiModel` field to each planned task based on its complexity:
+
+```typescript
+// src/lib/ai/schemas.ts
+geminiModel: z
+  .enum(['gemini-3-flash-preview', 'gemini-3-pro-preview'])
+  .describe(
+    'Recommended Gemini model for this task. Use flash for straightforward tasks, pro for complex reasoning',
+  )
+```
+
+The value is persisted in the `tasks` table and used when the task executor calls `executeGeminiStreaming` inside the sandbox.
+
+### Assignment rules (from the planner system prompt)
+
+- Use **`gemini-3-flash-preview`** for low-to-medium complexity tasks:
+  - UI components and layouts
+  - Simple CRUD operations
+  - Styling and theming
+  - Copy and content changes
+
+- Use **`gemini-3-pro-preview`** for high-complexity tasks:
+  - Authentication and authorisation setup
+  - Complex state management and architecture
+  - Multi-file refactors
+  - Integration with external services
+
+The default model in the database schema is `gemini-3-pro-preview`:
+
+```typescript
+// src/lib/db/schema.ts
+geminiModel: geminiModelEnum('gemini_model')
+  .default('gemini-3-pro-preview')
+  .notNull()
+```
+
+## YOLO mode
+
+All Gemini CLI invocations inside sandboxes run with the `--yolo` flag enabled by default:
+
+```typescript
+// src/lib/sandbox/providers/e2b.ts
+async executeGemini(sandboxId, options) {
+  const { prompt, model = 'gemini-3-pro-preview', yolo = true } = options
+  // ...
+  const geminiArgs = [
+    yolo ? '--yolo' : '',
+    `--model ${model}`,
+    `-p "${prompt}"`,
+  ]
+}
+```
+
+YOLO mode tells the Gemini CLI to proceed with file edits and shell commands without asking for interactive confirmation. This is required for fully autonomous, unattended task execution inside the sandbox.
+
+<Warning>
+  YOLO mode gives the Gemini CLI agent broad write access inside the sandbox. The sandbox is isolated from your production environment, but the agent can modify any file in the project directory and run arbitrary commands. Review the generated pull request before merging.
+</Warning>
+
+## GEMINI_MODEL override
+
+During development and testing you can override the model for all tasks by setting the `GEMINI_MODEL` environment variable:
+
+```bash
+# .env.local
+GEMINI_MODEL="gemini-3-pro-preview"
+```
+
+This is useful when you want to force a specific model for a test run regardless of what the planner assigned to individual tasks. It is **not** read by the production task executor and has no effect in production deployments.
+
+## Getting API keys
+
+<Steps>
+  <Step title="Open Google AI Studio">
+    Go to [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey). Sign in with a Google account.
+  </Step>
+  <Step title="Create two API keys">
+    Create one key for the server backend (`GOOGLE_GENERATIVE_AI_API_KEY`) and a second key for sandbox agents (`AGENT_GEMINI_API_KEY`). Giving them distinct names in AI Studio makes quota monitoring easier.
+  </Step>
+  <Step title="Add the keys to your environment">
+    ```bash
+    # .env.local
+    GOOGLE_GENERATIVE_AI_API_KEY="your-server-key"
+    AGENT_GEMINI_API_KEY="your-sandbox-key"
+    ```
+  </Step>
+</Steps>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="API key errors in the server logs">
+    Both `GOOGLE_GENERATIVE_AI_API_KEY` and `AGENT_GEMINI_API_KEY` are **required** variables. If either is missing, the application throws at startup:
+
+    ```
+    Error: Missing required environment variable: GOOGLE_GENERATIVE_AI_API_KEY
+    ```
+
+    Verify that your `.env.local` file contains both keys and that it is located at the repository root.
+  </Accordion>
+  <Accordion title="Quota errors during task execution">
+    Task execution is token-intensive. If you see `429 Resource Exhausted` errors in sandbox logs, you have hit the rate limit on `AGENT_GEMINI_API_KEY`. Increase the quota in [Google AI Studio](https://aistudio.google.com) or switch to a paid tier.
+  </Accordion>
+  <Accordion title="Gemini CLI cannot authenticate inside the sandbox">
+    Check that `AGENT_GEMINI_API_KEY` is set and non-empty. Dev0 writes the key to both the sandbox environment and `$HOME/.gemini/.env`. If the Gemini CLI still fails to authenticate, confirm that the key has not been revoked in Google AI Studio.
+  </Accordion>
+  <Accordion title="Wrong model is being used for a task">
+    The model is assigned at planning time and stored in the `tasks` table (`gemini_model` column). You can inspect the value in the database. If you want to change the model for a specific task, update the record directly or re-plan the project.
+  </Accordion>
+</AccordionGroup>

@@ -1,0 +1,89 @@
+---
+title: "Introduction"
+description: "Dev0 is an agentic engineering platform that turns ideas into GitHub pull requests — autonomously."
+---
+
+Dev0 is an agentic engineering platform inspired by the Ralph loop: let a code agent run until the task is actually done, but keep it contained, auditable, and reviewable. You describe a product idea, Dev0 plans the work, executes each task inside a secure sandbox, and ships the result as a GitHub pull request. Engineers stay in control as technical leads while the platform handles execution.
+
+## Core concept
+
+The Dev0 workflow follows a straight line from idea to merged code:
+
+1. **Describe your idea** — type a rough description of what you want to build.
+2. **Preview** — Gemini 3 Flash turns your input into a project name, tagline, and description.
+3. **Plan** — Gemini 3 Pro generates a phased task graph with dependencies and model assignments.
+4. **Execute** — each task runs inside an isolated E2B sandbox via Gemini CLI in YOLO mode.
+5. **Stream** — live JSONL events flow from the sandbox to your browser in real time.
+6. **Review** — the task surfaces as a GitHub PR you can approve, request changes on, or merge.
+
+Every step is visible, every result is reviewable, and nothing lands in your repo without passing through your review.
+
+## Who it's for
+
+<CardGroup cols={2}>
+  <Card title="Solo engineers" icon="user">
+    Delegate feature work to agents and focus your attention on architecture and review.
+  </Card>
+  <Card title="Startups" icon="rocket">
+    Reduce build time with PR-first automation that keeps quality gates in place.
+  </Card>
+  <Card title="Teams" icon="users">
+    Use review as the control plane for AI execution — your process, accelerated.
+  </Card>
+  <Card title="Hackathon teams" icon="bolt">
+    Turn ideas into working code fast, with live progress visible to the whole team.
+  </Card>
+</CardGroup>
+
+## Key concepts
+
+### Projects
+
+A **Project** is the top-level container. It holds the original idea (vibe input), the generated specification, the GitHub repository URL, and all associated tasks. Projects move through statuses: `PLANNING` → `READY` → `ACTIVE` → `COMPLETED`.
+
+### Tasks
+
+A **Task** is a single atomic unit of work — scoped to one PR. Each task has a phase, an order within that phase, a list of dependency task IDs, and a Gemini model assignment. The planner generates 5–20 tasks per project.
+
+### Sandboxes
+
+A **Sandbox** is an isolated E2B environment that runs for the duration of a single task execution. The orchestrator provisions a sandbox, clones the project repository into it, runs Gemini CLI in YOLO mode, then tears it down after the PR is created.
+
+### The agent pipeline
+
+Three agents coordinate to take an idea to a pull request:
+
+| Agent | Model | Responsibility |
+|---|---|---|
+| Preview Agent | `gemini-3-flash-preview` | Generates project name, tagline, and description from vibe input |
+| Planner Agent | `gemini-3-pro-preview` | Produces a phased task graph with dependencies and model selection |
+| Executor (Gemini CLI) | `gemini-3-flash-preview` or `gemini-3-pro-preview` | Implements the task inside the sandbox and writes an `agent-result.json` |
+
+## Prerequisites
+
+To run Dev0 locally you need accounts and credentials for these services:
+
+- **Bun** — the runtime and package manager
+- **PostgreSQL** — stores projects, tasks, sandboxes, and execution logs
+- **E2B** — provides the isolated sandbox environments ([e2b.dev](https://e2b.dev))
+- **Google Gemini API** — powers the Preview and Planner agents via the Vercel AI SDK
+- **Gemini CLI API key** — injected into sandboxes for autonomous YOLO-mode execution
+- **Upstash Redis** — pub/sub channel for real-time log and status streaming
+- **GitHub token** — bot account used to create repositories and open pull requests
+
+## Explore further
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="play" href="/quickstart">
+    Clone the repo, configure your environment, and start the dev server in minutes.
+  </Card>
+  <Card title="How it works" icon="diagram-project" href="/how-it-works">
+    Deep-dive into the full pipeline from idea to merged PR.
+  </Card>
+  <Card title="Architecture overview" icon="building" href="/architecture/overview">
+    Explore the system design, data model, and service boundaries.
+  </Card>
+  <Card title="Tech stack" icon="layer-group" href="/architecture/tech-stack">
+    React 19, TanStack Start, Drizzle ORM, E2B, Upstash, and more.
+  </Card>
+</CardGroup>

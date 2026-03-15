@@ -1,0 +1,188 @@
+---
+title: "GitHub integration"
+description: "How Dev0 uses a GitHub bot account to create project repositories, manage branches, and open Pull Requests for every completed task."
+---
+
+Dev0 interacts with GitHub through a dedicated bot account. Every repository, branch, commit, and Pull Request created during a project's lifecycle is owned by this account. Human developers interact with the resulting PRs to review and merge AI-generated changes.
+
+## Bot account setup
+
+Two environment variables configure the GitHub integration:
+
+| Variable | Description |
+|---|---|
+| `GITHUB_TOKEN` | Personal access token (or fine-grained PAT) for the bot account. Used by the server and injected into every sandbox as `GITHUB_TOKEN` and `GH_TOKEN`. |
+| `GITHUB_BOT_USERNAME` | The GitHub username of the bot account. Used as the repository owner for all created repos and to identify bot-authored PR comments. |
+
+The `GitHubProvider` class initialises an Octokit client with these values:
+
+```ts
+// src/lib/git/github.ts
+export class GitHubProvider {
+  private octokit: Octokit
+  private owner: string
+
+  constructor() {
+    this.octokit = new Octokit({ auth: env.GITHUB_TOKEN })
+    this.owner = env.GITHUB_BOT_USERNAME
+  }
+}
+```
+
+<Note>
+  The `GITHUB_TOKEN` is also injected into the E2B sandbox as an env var so the `gh` CLI inside the sandbox can authenticate. It is never exposed to the Gemini model as a literal value — see [Sandbox execution](/features/sandbox-execution#security-secrets-and-log-redaction).
+</Note>
+
+## Repository creation
+
+When a project is created, `createProjectRepository` (in `src/lib/git/index.ts`) provisions a new GitHub repository under the bot account:
+
+<Steps>
+  <Step title="Generate repository name">
+    `generateRepoName(projectName)` sanitises the project name to a GitHub-safe slug and appends a short base-36 identifier for uniqueness:
+
+    ```ts
+    // e.g. "RetroLog" → "retrolog-lz4k8f2a"
+    const repoName = generateRepoName(project.name)
+    ```
+  </Step>
+  <Step title="Create from template">
+    The repo is forked from the appropriate template repository owned by the bot account. The template is selected based on the project's `techStack`:
+
+    | `techStack` | Template repo |
+    |---|---|
+    | `react-vite` | `react-vite-template` |
+    | `tanstack-start` | `tanstack-template` |
+    | `nextjs` | `nextjs-template` |
+
+    ```ts
+    const repo = await github.createFromTemplate({
+      templateName: techStack,   // maps to template repo name
+      repoName,
+      description: repoDescription,
+      isPrivate: false,
+    })
+    ```
+  </Step>
+  <Step title="Commit initial files">
+    Four files are committed to the default branch in a single Git tree operation:
+
+    | File | Contents |
+    |---|---|
+    | `README.md` | AI-generated project README |
+    | `TASKLIST.md` | Full task list (title + description per task) |
+    | `LEARNINGS.md` | Empty learnings template for the agent to populate |
+    | `.dev0/RULES.md` | Tech-stack-specific coding rules for the agent |
+  </Step>
+  <Step title="Update project record">
+    `projects.repoUrl` and `projects.repoName` are written to the database, and `projects.status` is promoted to `READY`.
+  </Step>
+</Steps>
+
+## Branch naming convention
+
+Every task execution creates a dedicated branch:
+
+```
+dev0/task-<task-uuid>
+```
+
+Example: `dev0/task-a1b2c3d4-e5f6-7890-abcd-ef1234567890`
+
+The branch is created from the current default branch (`master` or `main`) inside the sandbox via `git checkout -B`. Before branching, the sandbox syncs to the latest default branch commit using `git fetch` + `git pull --ff-only`.
+
+## Automated PR creation
+
+After the Gemini CLI completes successfully and all changes are committed, the orchestrator creates a Pull Request using the `gh` CLI inside the sandbox:
+
+```bash
+gh pr create \
+  --title "<agentResult.prTitle or feat: <task.title>>" \
+  --body "<agentResult.prBody>"
+```
+
+The PR metadata written by the agent comes from `agent-result.json`:
+
+```json
+{
+  "status": "success",
+  "commitMessage": "feat: implement activity feed component",
+  "prTitle": "feat: activity feed with filtering",
+  "prBody": "Implements the activity feed...\n\n## Changes\n- ...",
+  "notes": "Used local storage for persistence as per spec."
+}
+```
+
+If `agent-result.json` is absent or malformed, fallback values are used:
+- `commitMessage`: `feat: complete task <task.title>`
+- `prTitle`: `feat: <task.title>`
+- `prBody`: empty string
+
+## PR metadata storage
+
+Once the PR is created the URL is parsed and stored on the task row:
+
+| Field | Value |
+|---|---|
+| `tasks.prUrl` | Full GitHub PR URL, e.g. `https://github.com/bot/retrolog-lz4k/pull/3` |
+| `tasks.prNumber` | Numeric PR number, e.g. `3` |
+
+These fields are used by the review workflow to fetch PR details, comments, and file diffs without needing to re-parse the URL every time.
+
+## GitHubProvider API
+
+All GitHub operations go through `GitHubProvider` (wrapping Octokit). Key methods:
+
+<AccordionGroup>
+  <Accordion title="createFromTemplate(options)">
+    Creates a new repository from a template. Returns `RepoInfo` with `name`, `fullName`, `htmlUrl`, `cloneUrl`, and `defaultBranch`.
+
+    ```ts
+    const repo = await github.createFromTemplate({
+      templateName: 'react-vite', // maps to 'react-vite-template'
+      repoName: 'my-app-lz4k8f2a',
+      description: 'A cool app',
+      isPrivate: false,
+    })
+    ```
+  </Accordion>
+  <Accordion title="createInitialFiles(options)">
+    Commits multiple files to the repository in a single Git tree + commit operation. Efficient for initial project scaffolding.
+  </Accordion>
+  <Accordion title="createPullRequest(options)">
+    Opens a PR from `head` branch to `base` (default: `master`). Returns `{ number, htmlUrl, state }`.
+  </Accordion>
+  <Accordion title="mergePullRequest(options)">
+    Merges a PR using the specified method. Dev0 uses **squash** merge by default:
+
+    ```ts
+    await github.mergePullRequest({
+      repoName: 'retrolog-lz4k8f2a',
+      prNumber: 3,
+      mergeMethod: 'squash', // default
+    })
+    ```
+  </Accordion>
+  <Accordion title="listPullRequests(options)">
+    Lists PRs for a repository (state: `open` | `closed` | `all`). Used by the review workflow to bulk-fetch PR state.
+  </Accordion>
+  <Accordion title="listPullRequestComments(options)">
+    Fetches both issue-level comments and review comments for a PR. Used to populate the review sidebar.
+  </Accordion>
+  <Accordion title="listPullRequestFiles(options)">
+    Returns the file diff list for a PR. Used to render the file tree in the review view.
+  </Accordion>
+  <Accordion title="compareCommits(options)">
+    Compares two SHAs and returns the full diff including per-file patches. Used by `getReviewPRFiles`.
+  </Accordion>
+</AccordionGroup>
+
+## Authentication in the sandbox
+
+The sandbox authenticates git operations by injecting the token directly into the remote URL:
+
+```
+https://x-access-token:<GITHUB_TOKEN>@github.com/<owner>/<repo>.git
+```
+
+This is done server-side in `withGithubToken` before the URL is passed to any git command, so the token is never echoed to stdout in a form that could appear in logs.

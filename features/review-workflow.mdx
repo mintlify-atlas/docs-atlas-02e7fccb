@@ -1,0 +1,193 @@
+---
+title: "Review workflow"
+description: "How Dev0 presents completed task Pull Requests for human review, including PR summaries, file diffs, and the merge action that closes the loop."
+---
+
+Once a task's execution succeeds, the agent opens a GitHub Pull Request and the task transitions to `REVIEW` status. A developer reviews the PR inside Dev0's review UI and either merges it (advancing the task to `DONE`) or requests changes.
+
+## Task lifecycle in the review flow
+
+```
+PENDING → RUNNING → REVIEW → DONE
+                          ↘ (request changes) → FAILED → PENDING (retry)
+```
+
+The `REVIEW` state is set by the orchestrator in `completeTask` after a successful execution:
+
+```ts
+await db.update(tasks).set({
+  status: 'REVIEW',
+  prUrl: result.prUrl ?? null,
+}).where(eq(tasks.id, taskId))
+```
+
+At the same time a `execution.task_review` event is emitted on the realtime channel so the browser can update its UI without polling.
+
+## Review UI flow
+
+<Steps>
+  <Step title="PR list">
+    The review panel calls `getReviewPRList` to fetch all tasks with associated PRs for the current project. Tasks in any status with a `prUrl` or `prNumber` are included.
+  </Step>
+  <Step title="Select a PR">
+    The developer selects a task from the list. `getReviewPRSummary` is called to load the PR header, stats, and comments.
+  </Step>
+  <Step title="Inspect file diffs">
+    `getReviewPRFiles` returns the per-file diff list. Each file entry includes a `patch` string with the unified diff.
+  </Step>
+  <Step title="Merge or request changes">
+    The developer clicks **Merge** → `mergePullRequest` squash-merges the PR and sets the task status to `DONE`. Or they add a comment to the PR on GitHub and click **Request changes** to mark the task for retry.
+  </Step>
+</Steps>
+
+## Server action reference
+
+### `getReviewPRList`
+
+Returns an array of `ReviewPRListItem` for all tasks with PRs in the project, ordered by `(phase ASC, order ASC)`:
+
+```ts
+import { getReviewPRList } from '@/lib/actions/review'
+
+const items = await getReviewPRList({ projectId })
+```
+
+```ts
+type ReviewPRListItem = {
+  taskId: string
+  taskTitle: string
+  taskStatus: TaskStatus
+  taskPhase: number
+  taskCreatedAt: string
+  geminiModel: string
+  prNumber: number
+  prUrl: string
+  prTitle?: string | null
+  prState?: 'open' | 'closed' | 'merged'
+  prUpdatedAt?: string | null
+}
+```
+
+When the project has a `repoName`, the function fetches all PRs in a single `listPullRequests` call and maps them to tasks — this is more efficient than fetching each PR individually.
+
+### `getReviewPRSummary`
+
+Fetches full PR metadata and all comments (issue-level and review-level) for a single task's PR:
+
+```ts
+const summary = await getReviewPRSummary({ projectId, taskId })
+```
+
+```ts
+type ReviewPRSummary = {
+  taskId: string
+  prNumber: number
+  title: string
+  body: string | null
+  state: 'open' | 'closed' | 'merged'
+  createdAt: string
+  updatedAt: string
+  headBranch: string     // e.g. "dev0/task-<uuid>"
+  baseBranch: string     // e.g. "master"
+  additions: number
+  deletions: number
+  changedFiles: number
+  commits: number
+  comments: ReviewPRComment[]
+}
+```
+
+Comments from the bot account (`GITHUB_BOT_USERNAME`) are tagged `authorType: 'agent'`; all others are `authorType: 'user'`. This lets the UI visually distinguish agent-written notes from human review comments.
+
+### `getReviewPRFiles`
+
+Returns the list of changed files and their unified diffs by comparing the PR's base and head SHAs:
+
+```ts
+const files = await getReviewPRFiles({ projectId, taskId })
+```
+
+```ts
+type ReviewPRFile = {
+  filename: string
+  status: 'added' | 'modified' | 'removed' | 'renamed' | 'copied' | 'changed'
+  additions: number
+  deletions: number
+  changes: number
+  sha: string
+  patch?: string | null          // unified diff patch string
+  previousFilename?: string | null  // set when status is 'renamed'
+}
+```
+
+The diff is computed with `GitHubProvider.compareCommits` using the PR's `base.sha` and `head.sha` rather than the branch names, ensuring the diff is accurate even after the base branch has advanced.
+
+### `mergePullRequest`
+
+Squash-merges the PR and transitions the task to `DONE`:
+
+```ts
+const result = await mergePullRequest({ projectId, taskId })
+// Returns: { success: boolean; message: string }
+```
+
+Internally this calls:
+
+```ts
+await github.mergePullRequest({
+  repoName: prContext.ref.repoName,
+  prNumber: prContext.ref.prNumber,
+  mergeMethod: 'squash',
+})
+
+await db.update(tasks)
+  .set({ status: 'DONE' })
+  .where(eq(tasks.id, taskId))
+```
+
+<Note>
+  Only **squash** merge is used. This keeps the default branch history linear — each merged task produces exactly one commit on `master`.
+</Note>
+
+## Request-changes flow
+
+If the developer wants the agent to revise its work:
+
+<Steps>
+  <Step title="Add a comment on GitHub">
+    Leave a review comment on the PR describing what needs to change. The agent will read these comments in context on the next execution.
+  </Step>
+  <Step title="Reset task status">
+    Call `updateTaskStatus` to move the task back to `PENDING` (or `FAILED` if the current attempt should count against the retry limit):
+
+    ```ts
+    import { updateTaskStatus } from '@/lib/actions/project'
+
+    await updateTaskStatus({
+      taskId,
+      status: 'PENDING',
+    })
+    ```
+  </Step>
+  <Step title="Re-run execution">
+    Trigger the execution pipeline again. The agent will pick up the task, read the existing PR comments (visible in the repo context), and produce an updated branch.
+  </Step>
+</Steps>
+
+<Warning>
+  Resetting a task to `PENDING` does not automatically close the existing PR. The agent will create a new `dev0/task-<id>` branch — which force-pushes the existing branch — and the open PR will update in place.
+</Warning>
+
+## PR resolution helper
+
+All review actions resolve the PR reference from the task record using `resolvePullRequestContext`. This function accepts both a `prUrl` (parsed with a regex to extract owner/repo/number) and a `prNumber` + `repoName` pair, making it robust against partially populated task records:
+
+```ts
+// Prefers prUrl when present; falls back to prNumber + repoName
+const prContext = await resolvePullRequestContext(task, project.repoName)
+if (!prContext) {
+  // PR not yet created or reference is missing
+}
+```
+
+The resolved context includes `baseSha` and `headSha` so downstream calls (`compareCommits`, `mergePullRequest`) always operate on exact commit SHAs rather than mutable branch refs.

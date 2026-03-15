@@ -1,0 +1,157 @@
+---
+title: "Local deployment"
+description: "Run Dev0 locally in development mode or as a production build on your own machine."
+---
+
+This guide walks through getting Dev0 running on your local machine, from cloning the repository through starting the development server.
+
+## Prerequisites
+
+Before you begin, make sure you have the following installed and available:
+
+| Requirement | Notes |
+|---|---|
+| **Bun** | Runtime and package manager. Install from [bun.sh](https://bun.sh) |
+| **PostgreSQL** | Local instance or a hosted database (Neon, Supabase, etc.) |
+| **E2B API key** | Sandbox execution — obtain at [e2b.dev](https://e2b.dev) |
+| **Google Gemini API key** | For the backend AI SDK (`GOOGLE_GENERATIVE_AI_API_KEY`) |
+| **Agent Gemini API key** | Injected into sandboxes for YOLO-mode execution (`AGENT_GEMINI_API_KEY`). Can be the same key. |
+| **Upstash Redis** | REST URL and token from [upstash.com](https://upstash.com) |
+| **GitHub token** | A personal access token (or bot account) with repo and PR permissions |
+
+<Tip>
+  For PostgreSQL, the quickest path is a free-tier [Neon](https://neon.tech) or [Supabase](https://supabase.com) database. Both provide a `postgresql://` connection string you can paste directly into `DATABASE_URL`. If you prefer a local instance, `postgresql://postgres:postgres@localhost:5432/dev0` works out of the box once you create the `dev0` database.
+</Tip>
+
+## Setup
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/manasseh-zw/dev0.git
+    cd dev0
+    ```
+  </Step>
+
+  <Step title="Install dependencies">
+    ```bash
+    bun install
+    ```
+
+    Bun reads `package.json` and installs all runtime and dev dependencies, including Drizzle ORM, TanStack Start, the Vercel AI SDK, and E2B.
+  </Step>
+
+  <Step title="Configure environment variables">
+    Copy the example environment file and fill in your values:
+
+    ```bash
+    cp .env.example .env.local
+    ```
+
+    Open `.env.local` and set every variable:
+
+    ```bash .env.local
+    # Database (PostgreSQL)
+    DATABASE_URL="postgresql://user:password@localhost:5432/dev0"
+
+    # E2B Sandbox Orchestration
+    E2B_API_KEY=""
+    E2B_TEMPLATE="dev0-universal"
+    E2B_SANDBOX_TIMEOUT_MS="3600000"
+
+    # Google Gemini (via Vercel AI SDK — used by the backend)
+    GOOGLE_GENERATIVE_AI_API_KEY=""
+
+    # Agent Gemini API Key (injected into sandboxes for autonomous coding)
+    AGENT_GEMINI_API_KEY=""
+
+    # GitHub Bot Account (for repo creation & PR operations)
+    GITHUB_TOKEN=""
+    GITHUB_BOT_USERNAME="dev0-agent"
+
+    # Application
+    APP_URL="http://localhost:3000"
+    NODE_ENV="development"
+
+    # Upstash Realtime (Redis)
+    UPSTASH_REDIS_REST_URL=""
+    UPSTASH_REDIS_REST_TOKEN=""
+    ```
+
+    <Note>
+      `E2B_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `AGENT_GEMINI_API_KEY`, `GITHUB_TOKEN`, `UPSTASH_REDIS_REST_URL`, and `UPSTASH_REDIS_REST_TOKEN` are **required** at startup. The server will throw an error if any of these are missing.
+    </Note>
+
+    <Info>
+      `AGENT_GEMINI_API_KEY` is a separate key from `GOOGLE_GENERATIVE_AI_API_KEY`. It is injected directly into E2B sandbox environments so the Gemini CLI can run in YOLO mode. You can use the same Gemini API key for both variables during development.
+    </Info>
+  </Step>
+
+  <Step title="Run database migrations">
+    Apply the Drizzle ORM schema to your PostgreSQL database:
+
+    ```bash
+    bun run db:migrate
+    ```
+
+    This runs `drizzle-kit migrate` against the `DATABASE_URL` in your `.env.local`. Migrations are stored in the `./drizzle` directory. You only need to run this once on initial setup and again after pulling schema changes.
+  </Step>
+
+  <Step title="Start the development server">
+    ```bash
+    bun run dev
+    ```
+
+    This starts the Vite + TanStack Start dev server. The app is available at:
+
+    ```
+    http://localhost:3000
+    ```
+
+    The dev server supports hot module replacement (HMR) for frontend changes and restarts server-side code automatically.
+  </Step>
+</Steps>
+
+## Local production build
+
+To test a production build locally before deploying:
+
+```bash
+bun run build
+bun run start
+```
+
+`bun run build` compiles the app with Vite and outputs to `.output/`. `bun run start` serves the compiled output using Bun directly (`bun --bun .output/server/index.mjs`).
+
+<Warning>
+  The build step (`vite build`) runs under Node.js internally to avoid a known memory issue with Bun + Vite for large builds. Node.js 22+ is required on your PATH when running `bun run build` locally. This is handled automatically in the Docker image.
+</Warning>
+
+## Running tests
+
+```bash
+bun run test
+```
+
+This executes the full Vitest test suite. Individual test targets are also available:
+
+```bash
+# Sandbox integration tests
+bun run test:sandbox
+
+# GitHub integration tests
+bun run test:github
+```
+
+<Note>
+  Sandbox and GitHub integration tests make real API calls to E2B and GitHub. Make sure your `.env.local` has valid credentials before running these suites.
+</Note>
+
+## Other useful commands
+
+| Command | Description |
+|---|---|
+| `bun run db:generate` | Generate a new Drizzle migration from schema changes |
+| `bun run db:push` | Push schema directly to the DB (skips migration files, dev only) |
+| `bun run format` | Format all source files with Prettier |
+| `bun run preview` | Preview the production build via Vite's preview server |
